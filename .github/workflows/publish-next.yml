@@ -1,0 +1,113 @@
+name: Publish npm prerelease
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: none
+
+concurrency:
+  group: spaces-deployer-publish-next
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'slicemedia/spaces-deployer' && github.event.repository.private == false && github.ref == 'refs/heads/main' && vars.SLICEMEDIA_NPM_PUBLISH_NEXT_ENABLED == 'true'
+    environment: release-sanitize
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: test "$(git rev-parse --verify HEAD^{commit})" = "$GITHUB_SHA" && test "$(git ls-remote --exit-code origin refs/heads/main | awk '{print $1}')" = "$GITHUB_SHA" && test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - run: node scripts/sanitize.mjs
+        env:
+          SLICEMEDIA_FORBIDDEN_TERMS: ${{ secrets.SLICEMEDIA_FORBIDDEN_TERMS }}
+          SLICEMEDIA_REQUIRE_FORBIDDEN_TERMS: "true"
+      - uses: pnpm/setup@84cb39b217b10273981911c288cd62326dc7c6d2 # v2
+        with:
+          version: 11.21.0
+          runtime: node@24
+          cache: true
+          install: false
+      - run: npm install --global npm@11.19.0 --ignore-scripts --registry https://registry.npmjs.org/ --userconfig /dev/null
+      - run: test "$(npm --version)" = "11.19.0"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check:quality
+      - run: pnpm build
+      - run: pnpm sanitize
+      - run: pnpm pack:check
+      - run: pnpm release:archive
+      - run: pnpm release:publish:check
+        env:
+          GITHUB_RELEASE_REF: ${{ github.ref }}
+          GITHUB_RELEASE_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+          SLICEMEDIA_NPM_PUBLISH_NEXT_ENABLED: ${{ vars.SLICEMEDIA_NPM_PUBLISH_NEXT_ENABLED }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: npm-package-${{ github.sha }}
+          path: .npm-release
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 1
+          compression-level: 0
+  publish:
+    needs: prepare
+    if: github.repository == 'slicemedia/spaces-deployer' && github.event.repository.private == false && github.ref == 'refs/heads/main' && vars.SLICEMEDIA_NPM_PUBLISH_NEXT_ENABLED == 'true' && needs.prepare.result == 'success'
+    environment: npm-next
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: test "$(git rev-parse --verify HEAD^{commit})" = "$GITHUB_SHA" && test "$(git ls-remote --exit-code origin refs/heads/main | awk '{print $1}')" = "$GITHUB_SHA" && test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          check-latest: false
+      - run: npm install --global npm@11.19.0 --ignore-scripts --registry https://registry.npmjs.org/ --userconfig /dev/null
+      - run: test "$(npm --version)" = "11.19.0"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-package-${{ github.sha }}
+          path: .npm-release
+      - run: node scripts/assert-npm-publication-artifact.mjs
+        env:
+          GITHUB_REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+          SLICEMEDIA_NPM_PUBLISH_NEXT_ENABLED: ${{ vars.SLICEMEDIA_NPM_PUBLISH_NEXT_ENABLED }}
+          SLICEMEDIA_RELEASE_ENVIRONMENT: npm-next
+      - run: test "$(git rev-parse --verify HEAD^{commit})" = "$GITHUB_SHA" && test "$(git ls-remote --exit-code origin refs/heads/main | awk '{print $1}')" = "$GITHUB_SHA" && test -z "$(git status --porcelain=v1 --untracked-files=all)" && test "$(npm --version)" = "11.19.0"
+      - run: npm publish .npm-release/package.tgz --ignore-scripts --tag next --access public --provenance --registry https://registry.npmjs.org/ --userconfig /dev/null
+  verify:
+    needs:
+      - prepare
+      - publish
+    if: github.repository == 'slicemedia/spaces-deployer' && github.event.repository.private == false && github.ref == 'refs/heads/main' && vars.SLICEMEDIA_NPM_PUBLISH_NEXT_ENABLED == 'true' && needs.prepare.result == 'success' && needs.publish.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: test "$(git rev-parse --verify HEAD^{commit})" = "$GITHUB_SHA" && test "$(git ls-remote --exit-code origin refs/heads/main | awk '{print $1}')" = "$GITHUB_SHA" && test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          check-latest: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-package-${{ github.sha }}
+          path: .npm-release
+      - run: node scripts/verify-npm-publication.mjs
+        env:
+          GITHUB_RELEASE_SHA: ${{ github.sha }}

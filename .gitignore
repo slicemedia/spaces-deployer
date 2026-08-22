@@ -1,0 +1,13 @@
+node_modules/
+.private/
+dist/
+coverage/
+artifacts/
+.DS_Store
+.env
+.env.*
+!.env.example
+*.local
+*.tgz
+.slicemedia/
+.npm-release/

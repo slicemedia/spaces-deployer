@@ -1,0 +1,47 @@
+name: Release PR
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: none
+
+concurrency:
+  group: spaces-deployer-release-pr
+  cancel-in-progress: false
+
+jobs:
+  version:
+    if: github.repository == 'slicemedia/spaces-deployer' && vars.SLICEMEDIA_RELEASE_PR_ENABLED == 'true'
+    environment: release-sanitize
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: node scripts/sanitize.mjs
+        env:
+          SLICEMEDIA_FORBIDDEN_TERMS: ${{ secrets.SLICEMEDIA_FORBIDDEN_TERMS }}
+          SLICEMEDIA_REQUIRE_FORBIDDEN_TERMS: "true"
+      - uses: pnpm/setup@84cb39b217b10273981911c288cd62326dc7c6d2 # v2
+        with:
+          version: 11.21.0
+          runtime: node@22
+          cache: true
+          install: false
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm release:prepare:check
+        env:
+          GITHUB_REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+      - uses: changesets/action/version@8488615a623b1b9c987934bb89eae8af6a946ac1 # v2.1.1
+        with:
+          script: pnpm version-packages
+          commit-message: "chore: version Spaces Deployer"
+          pr-title: "chore: version Spaces Deployer"
+          pr-draft: create

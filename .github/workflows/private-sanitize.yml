@@ -1,0 +1,23 @@
+name: Private sanitization
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  sanitize:
+    if: github.repository == 'slicemedia/spaces-deployer' && github.ref == 'refs/heads/main'
+    environment: release-sanitize
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: node scripts/sanitize.mjs
+        env:
+          SLICEMEDIA_FORBIDDEN_TERMS: ${{ secrets.SLICEMEDIA_FORBIDDEN_TERMS }}
+          SLICEMEDIA_REQUIRE_FORBIDDEN_TERMS: "true"
