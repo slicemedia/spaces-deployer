@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 
 import {
   GetBucketVersioningCommand,
@@ -60,6 +61,28 @@ describe("DigitalOcean Spaces deployment", () => {
     const serialized = JSON.stringify(first);
     expect(serialized).not.toContain(credentials.accessKeyId);
     expect(serialized).not.toContain(credentials.secretAccessKey);
+  });
+
+  it("normalizes surrounding prefix slashes while preserving safe interior segments", async () => {
+    const directory = await fixtureDirectory();
+    const plan = await createDeploymentPlan({
+      ...planOptions(directory),
+      prefix: "///releases/archive///",
+    });
+
+    expect(plan.target.prefix).toBe("releases/archive");
+    expect(plan.files.every((file) => file.key.startsWith("releases/archive/"))).toBe(true);
+  });
+
+  it("rejects a long interior slash run without pathological backtracking", async () => {
+    const directory = await fixtureDirectory();
+    const prefix = `releases${"/".repeat(100_000)}archive`;
+    const startedAt = performance.now();
+
+    await expect(createDeploymentPlan({ ...planOptions(directory), prefix })).rejects.toThrow(
+      "prefix segment must be one safe path segment",
+    );
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
   });
 
   it("uses the same UTF-8 byte order when planning and validating paths", async () => {
