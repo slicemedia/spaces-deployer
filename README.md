@@ -6,7 +6,7 @@ The package exposes a TypeScript API and the `slicemedia-spaces` CLI. It deliber
 
 ## Install
 
-After an npm release is available, install it with the consuming project's package manager:
+Install the public release candidate from npm's `next` tag with the consuming project's package manager:
 
 ```sh
 # pnpm
@@ -22,7 +22,7 @@ yarn add @slicemedia/spaces-deployer@next
 Use the command that matches the consuming project. pnpm is used to develop this repository, but
 generated projects and package consumers do not need to use pnpm.
 
-The prerelease supports Node.js `^22.13.0` and `^24.0.0`.
+The release candidate supports Node.js `^22.13.0` and `^24.0.0`.
 
 The TypeScript API and general CLI behavior are tested on Linux and Windows. The private plan-file
 security boundary is supported on POSIX systems only: native Windows does not expose the ownership,
@@ -142,6 +142,20 @@ DigitalOcean Spaces does not support the atomic conditional `PutObject` needed f
 
 An external writer can create or change a key after the complete HEAD preflight and before this process sends its PUT. Mandatory bucket versioning preserves the prior version in that race, but it does not prevent the race or guarantee which version another reader observes as current. Digest-derived key namespaces prevent legitimate plans with different content from selecting the same key; they do not act as a distributed lock.
 
+## Support and maintenance
+
+The supported Node.js ranges are the exact ranges declared in `package.json`. The TypeScript API and
+general CLI run on the documented Linux and Windows matrix, but the secure persisted plan-file
+boundary is guaranteed only on the POSIX environments described above.
+
+Before version 1.0, the most recent version under npm's `next` tag is the actively maintained
+release-candidate line. Once a `latest` release exists, the current `latest` line receives compatible
+security and defect fixes while `next` previews upcoming changes. Earlier `0.x` lines are maintained
+on a best-effort basis, and a minor `0.x` release may contain a breaking change documented in the
+changelog. Pin versions for production automation and review release notes before upgrading.
+Support is community-based and has no service-level guarantee. An exact semantic version identifies
+immutable package contents; `next` and `latest` are movable npm dist-tags, not versions.
+
 ## Development and releases
 
 ```sh
@@ -151,48 +165,68 @@ pnpm pack:check
 pnpm changeset
 ```
 
-Changesets controls package versions. During private incubation and after public launch, the Release
-PR workflow can only prepare a draft version PR. It is pinned, receives no npm token or OIDC
-permission, and accepts only the expected repository identity and explicit visibility. Keep the
-`SLICEMEDIA_RELEASE_PR_ENABLED` repository or organization variable unset until
-the organization permits GitHub Actions to create pull requests and the branch policy is reviewed;
-setting it to the exact string `true` only activates version-PR preparation after a push to `main`.
-There is no manual privileged trigger. The version job uses the main-only `release-sanitize`
-environment. CI validates source, tests, build output, sanitization, and the npm package manifest
-without publishing.
+The initial public release is `0.1.0`; its pre-release work is consolidated in the root changelog.
+After that release, Changesets controls version updates. The Release PR workflow can only prepare a
+draft version PR. It is pinned, receives no npm token or OIDC permission, and accepts only the
+expected repository identity and explicit visibility. Keep `SLICEMEDIA_RELEASE_PR_ENABLED` unset
+until the organization allows Actions pull requests and the branch policy is reviewed. Setting it
+to exactly `true` enables version preparation after a push to `main`; there is no manual privileged
+trigger.
 
-The separate dormant `Publish npm prerelease` workflow is manual, runs only from the current `main`
-commit, and accepts no npm token. Its archive-preparation job uses `release-sanitize`, while the
-minimal OIDC publisher is isolated in the protected `npm-next` environment and cannot read the
-private denylist. It requires a public repository, an explicitly non-private package, and
-`SLICEMEDIA_NPM_PUBLISH_NEXT_ENABLED=true`. Leave that variable unset until the npm scope, trusted
-publisher, required reviewers, final package name, and first-prerelease readiness gates have all
-been verified. Ordinary `pnpm check` and `pnpm version:check` remain fail-closed and require
-`private: true`; inherited environment variables cannot relax that rule. The dormant workflow uses
-the separate `pnpm release:publish:check`, whose explicit invocation guard and complete repository,
-visibility, branch, commit, enablement, credential, and workflow checks instead require
-`private: false`. It runs the shared quality, build, and sanitization gates first, then performs that
-guarded release check after creating the candidate archive so the final clean-source proof remains
-authoritative. The protected main scan, version-PR job, and prerelease preparation job require the
-private `SLICEMEDIA_FORBIDDEN_TERMS` environment secret as a non-empty JSON string array and declare
-`release-sanitize` explicitly. Pull-request CI contains no secret reference and always runs generic
-secret and naming checks. Text, UTF-8 base64, base64url, and hexadecimal rules are derived only at
-runtime, and reports contain rule indices and kinds rather than values. Local checks may use the
-same JSON in ignored `.private/denylist`; never commit or print it.
-Installation, tests, and archive preparation run in a separate job without OIDC
-permission. The minimal publishing job receives only that archive, proves its checkout is still
-live remote `main`, pins and verifies npm `11.19.0`, and rejects registry, user-configuration, and
-classic-token overrides. npm 12 is not allowed implicitly. It publishes the exact archive under
-`next` to `https://registry.npmjs.org/` and requires registry
-integrity to match the local archive. Only after that succeeds should the matching Git tag and
-GitHub Release be created from the exact version commit. Promotion to `latest` must reuse the
-already published artifact rather than rebuilding it.
+### First-package bootstrap
 
-The first public `0.x` prerelease is gated by automated tests, pack inspection, sanitization, and a
-clean-room consumer—not a live client deployment. Real client projects and disposable versioned
-Spaces buckets become pilots after the first `next` publication. Any discovered issue is fixed in a
-further `next` version. Do not promote to `latest` until those pilots cover repeat uploads,
-collisions, retained versions, receipt redaction, public retrieval, and project-specific delivery
-configuration, and the complete public-readiness review passes.
+npm requires a package to exist before its trusted publisher can be configured. The one-time
+bootstrap therefore uses a separately reviewed, identity-only `0.0.0-bootstrap.0` archive published
+with public access by a two-factor-protected npm organization owner under the non-default
+`bootstrap` tag. That archive must contain no runtime build, credentials, customer data, or release
+automation and must never be assigned to `next` or `latest`.
 
-Licensed under MIT.
+After verifying the bootstrap package's scope, owner, contents, version, and dist-tag, configure npm
+trusted publishing for `slicemedia/spaces-deployer`, `.github/workflows/publish-next.yml`, and the
+`npm-next` environment, with the `npm publish` action explicitly allowed. All real packages,
+starting with `0.1.0`, then use only the trusted-publisher workflow. Never add a classic npm token to
+Actions or derive the bootstrap by weakening the real publication guard.
+
+### Prerelease workflow
+
+The manual `Publish npm prerelease` workflow runs only from current remote `main`, accepts no npm
+token, and publishes only under `next`. Its preparation job runs the shared quality, build, pack,
+and sanitization gates in `release-sanitize`; the minimal OIDC publisher is isolated in the
+protected `npm-next` environment and cannot read the confidential denylist.
+
+Ordinary `pnpm check` and `pnpm version:check` require the package to declare `private: false`, so a
+missing, malformed, or private publication state fails closed. The separate guarded
+`pnpm release:publish:check` additionally requires the exact invocation
+context, a public repository, `main`, the live remote commit, explicit enablement, the reviewed
+workflow, and an environment without classic npm credentials or registry overrides.
+
+Keep `SLICEMEDIA_NPM_PUBLISH_NEXT_ENABLED` unset until the repository is public, branch protection
+and environment reviewers are active, the bootstrap and trusted publisher are verified, and the
+candidate has passed its final review. The workflow pins npm `11.19.0`, records one archive and its
+integrity before OIDC is available, passes only that archive to the publisher, publishes to the
+explicit npm registry with provenance, and verifies registry integrity afterward.
+
+After the first verified OIDC release, set the package's npm Publishing access to require
+two-factor authentication and disallow tokens. Trusted publishing is additive, so this setting
+closes token-based publication paths outside the reviewed workflow.
+
+The protected workflows require `SLICEMEDIA_FORBIDDEN_TERMS` as a non-empty JSON string array in
+`release-sanitize`. Pull-request CI cannot read it. Reports contain rule indices and kinds, never
+denylist values. Local checks may use the same JSON in ignored `.private/denylist`; never commit or
+print it.
+
+Create the matching Git tag and GitHub Release only after npm accepts the exact version commit.
+Promotion to `latest` must move the dist-tag to the already verified artifact and must not rebuild
+it. Real client projects and disposable versioned Spaces buckets become pilots after the first
+`next` release. Fixes ship as new immutable `next` versions; promotion waits until pilots cover
+repeat uploads, collisions, retained versions, receipt redaction, public retrieval, project-specific
+delivery configuration, and the complete public-readiness review.
+
+## AI-assisted development and independence
+
+AI tools assisted substantially with this project's implementation, tests, and documentation.
+AI-generated or AI-reviewed code can still contain defects. Production use requires human review,
+project-specific testing, and appropriate security, operational, and recovery validation.
+
+Licensed under MIT. The names DigitalOcean and DigitalOcean Spaces are used only to describe
+compatibility. This project is not affiliated with, sponsored by, or endorsed by DigitalOcean.

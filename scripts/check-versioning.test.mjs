@@ -4,10 +4,7 @@ import { dirname, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import {
-  validatePrivateVersionConfiguration,
-  validateSharedVersionConfiguration,
-} from "./check-versioning.mjs";
+import { validateSharedVersionConfiguration } from "./check-versioning.mjs";
 import { validateGuardedPublishNextReadiness } from "./assert-publish-next-safe.mjs";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -21,7 +18,6 @@ const changesets = {
   access: "public",
   baseBranch: "main",
   ignore: [],
-  privatePackages: { tag: false, version: true },
 };
 const privateManifest = {
   name: "@slicemedia/spaces-deployer",
@@ -51,21 +47,52 @@ function validateRelease(overrides = {}) {
   });
 }
 
-test("ordinary version validation accepts the private incubation manifest", () => {
-  assert.deepEqual(
-    validatePrivateVersionConfiguration({ changesets, packageManifest: privateManifest }),
-    [],
+test("ordinary version validation rejects a private package state", () => {
+  assert.match(
+    validateSharedVersionConfiguration({
+      changesets,
+      packageManifest: privateManifest,
+    }).join("\n"),
+    /must explicitly declare private=false/u,
   );
 });
 
-test("ordinary version validation rejects a public manifest", () => {
+test("ordinary version validation accepts the explicit public manifest", () => {
   assert.deepEqual(
     validateSharedVersionConfiguration({ changesets, packageManifest: publicManifest }),
     [],
   );
+});
+
+test("ordinary version validation fails closed when publication state is not explicit", () => {
+  const implicitManifest = { ...publicManifest };
+  delete implicitManifest.private;
   assert.match(
-    validatePrivateVersionConfiguration({ changesets, packageManifest: publicManifest }).join("\n"),
-    /must remain private/u,
+    validateSharedVersionConfiguration({
+      changesets,
+      packageManifest: implicitManifest,
+    }).join("\n"),
+    /must explicitly declare private=false/u,
+  );
+  assert.match(
+    validateSharedVersionConfiguration({
+      changesets,
+      packageManifest: { ...publicManifest, private: "false" },
+    }).join("\n"),
+    /must explicitly declare private=false/u,
+  );
+});
+
+test("ordinary version validation rejects private-package Changesets overrides", () => {
+  assert.match(
+    validateSharedVersionConfiguration({
+      changesets: {
+        ...changesets,
+        privatePackages: { tag: false, version: true },
+      },
+      packageManifest: publicManifest,
+    }).join("\n"),
+    /must not use privatePackages overrides/u,
   );
 });
 
@@ -102,7 +129,7 @@ test("release-publish validation rejects missing or wrong invocation and environ
   }
 });
 
-test("package scripts keep ordinary checks private and public checks explicit", () => {
+test("package scripts keep ordinary state checks and guarded publication explicit", () => {
   assert.equal(packageJson.scripts["version:check"], "node scripts/check-versioning.mjs");
   assert.match(packageJson.scripts.check, /pnpm version:check/u);
   assert.equal(

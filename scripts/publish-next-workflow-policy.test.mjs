@@ -30,7 +30,6 @@ const changesets = {
   access: "public",
   baseBranch: "main",
   ignore: [],
-  privatePackages: { tag: false, version: true },
 };
 const prepareEnvironment = {
   GITHUB_REPOSITORY: "slicemedia/spaces-deployer",

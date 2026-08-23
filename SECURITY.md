@@ -2,6 +2,10 @@
 
 Report suspected vulnerabilities privately through the repository's GitHub security advisory flow. Do not include real credentials, bucket names, endpoints, plan files, receipts, or client artifacts in a public issue.
 
+The active release candidate on npm's `next` tag and, once available, the current `latest` line
+receive best-effort security fixes. Older `0.x` lines do not receive guaranteed backports. This
+project provides no response-time, remediation, or long-term-support SLA.
+
 Slice Media Spaces Deployer treats planning, human review, exact confirmation, application,
 version-specific read-back, and receipt inspection as separate phases. Credentials must remain
 outside source control and are accepted by the CLI only through environment variables during

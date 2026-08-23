@@ -1,7 +1,7 @@
 {
   "name": "@slicemedia/spaces-deployer",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "description": "Content-addressed, version-preserving deployments to DigitalOcean Spaces.",
   "author": "Slice Media",
   "license": "MIT",
@@ -34,6 +34,7 @@
   "files": [
     "bin",
     "dist",
+    "CHANGELOG.md",
     "README.md",
     "LICENSE"
   ],

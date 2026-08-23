@@ -20,17 +20,17 @@ export function validateSharedVersionConfiguration({ changesets, packageManifest
   ) {
     errors.push("Package version must be a valid exact semantic version.");
   }
+  if (reviewedManifest.private !== false) {
+    errors.push("The public Spaces Deployer package must explicitly declare private=false.");
+  }
   if (reviewedChangesets.$schema !== "https://unpkg.com/@changesets/config@4.0.0/schema.json") {
     errors.push("Changesets must use the reviewed v4 configuration schema.");
   }
   if (reviewedChangesets.baseBranch !== "main" || reviewedChangesets.access !== "public") {
-    errors.push("Changesets must target main and preserve future public-package access metadata.");
+    errors.push("Changesets must target main and preserve public-package access metadata.");
   }
-  if (
-    reviewedChangesets.privatePackages?.version !== true ||
-    reviewedChangesets.privatePackages?.tag !== false
-  ) {
-    errors.push("Changesets must version, but never tag, the private package.");
+  if ("privatePackages" in reviewedChangesets) {
+    errors.push("Public Spaces Deployer versioning must not use privatePackages overrides.");
   }
   if (!Array.isArray(reviewedChangesets.ignore) || reviewedChangesets.ignore.length !== 0) {
     errors.push("The Spaces Deployer package must not be ignored by Changesets.");
@@ -38,18 +38,10 @@ export function validateSharedVersionConfiguration({ changesets, packageManifest
   return errors;
 }
 
-export function validatePrivateVersionConfiguration({ changesets, packageManifest } = {}) {
-  const errors = validateSharedVersionConfiguration({ changesets, packageManifest });
-  if (packageManifest?.private !== true) {
-    errors.push("The package must remain private during release preparation.");
-  }
-  return errors;
-}
-
 async function main() {
   const packageManifest = await readJson("package.json");
   const changesets = await readJson(".changeset/config.json");
-  const errors = validatePrivateVersionConfiguration({ changesets, packageManifest });
+  const errors = validateSharedVersionConfiguration({ changesets, packageManifest });
 
   if (errors.length > 0) {
     console.error(errors.join("\n"));
