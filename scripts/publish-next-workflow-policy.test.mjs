@@ -232,6 +232,18 @@ test("binds pack output, receipt, source commit, and registry metadata to one ex
     ),
     [],
   );
+  const metadataWithoutProvenance = JSON.parse(JSON.stringify(metadata));
+  delete metadataWithoutProvenance.versions[publicManifest.version].dist.attestations;
+  assert.notDeepEqual(
+    validateRegistryMetadata(
+      metadataWithoutProvenance,
+      publicManifest.name,
+      publicManifest.version,
+      hashes.integrity,
+      hashes.shasum,
+    ),
+    [],
+  );
   const statement = {
     _type: "https://in-toto.io/Statement/v1",
     subject: [
@@ -323,6 +335,30 @@ test("binds pack output, receipt, source commit, and registry metadata to one ex
               dsseEnvelope: {
                 payloadType: "application/vnd.in-toto+json",
                 payload: Buffer.from(JSON.stringify(wrongCommitStatement)).toString("base64"),
+              },
+            },
+          },
+        ],
+      },
+      publicManifest.name,
+      publicManifest.version,
+      hashes.integrity,
+      commit,
+    ),
+    [],
+  );
+  const wrongDigestStatement = JSON.parse(JSON.stringify(statement));
+  wrongDigestStatement.subject[0].digest.sha512 = "0".repeat(128);
+  assert.notDeepEqual(
+    validateProvenanceAttestations(
+      {
+        attestations: [
+          {
+            predicateType: "https://slsa.dev/provenance/v1",
+            bundle: {
+              dsseEnvelope: {
+                payloadType: "application/vnd.in-toto+json",
+                payload: Buffer.from(JSON.stringify(wrongDigestStatement)).toString("base64"),
               },
             },
           },
