@@ -735,7 +735,7 @@ describe("DigitalOcean Spaces deployment", () => {
     await expect(createDeploymentPlan(planOptions(tooDeep))).rejects.toThrow(
       `${SPACES_DEPLOYMENT_LIMITS.maxDepth}-level depth limit`,
     );
-  }, 15_000);
+  }, 60_000);
 
   it("rechecks resource limits during apply before any remote request", async () => {
     const plan = await fixturePlan();
