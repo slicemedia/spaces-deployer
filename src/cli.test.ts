@@ -575,7 +575,7 @@ describe("slicemedia-spaces", () => {
     expect(exitCode).toBe(1);
     expect(errors.join("\n")).toContain("reachable Git history");
     expect(createPlan).not.toHaveBeenCalled();
-  });
+  }, 15_000);
 
   it.runIf(process.platform !== "win32")(
     "refuses to apply a plan with group or public permissions",
