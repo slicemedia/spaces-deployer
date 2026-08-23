@@ -34,7 +34,30 @@ jobs:
           cache: true
           install: false
       - run: npm install --global npm@11.19.0 --ignore-scripts --registry https://registry.npmjs.org/ --userconfig /dev/null
-      - run: test "$(npm --version)" = "11.19.0"
+      - name: Prefer reviewed npm CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm_global_prefix="$(npm prefix -g)"
+          if [[ "$npm_global_prefix" != /* || "$npm_global_prefix" == *:* || "$npm_global_prefix" == *$'\n'* || "$npm_global_prefix" == *$'\r'* ]]; then
+            echo "npm global prefix is not a safe absolute PATH entry" >&2
+            exit 1
+          fi
+          npm_global_bin="${npm_global_prefix%/}/bin"
+          if [[ ! -d "$npm_global_bin" || ! -x "$npm_global_bin/npm" ]]; then
+            echo "reviewed npm executable was not found in the global npm bin directory" >&2
+            exit 1
+          fi
+          export PATH="$npm_global_bin:$PATH"
+          if [[ "$(command -v npm)" != "$npm_global_bin/npm" || "$(npm --version)" != "11.19.0" ]]; then
+            echo "reviewed npm 11.19.0 is not first on PATH" >&2
+            exit 1
+          fi
+          if [[ -z "${GITHUB_PATH:-}" || "$GITHUB_PATH" != /* || "$GITHUB_PATH" == *$'\n'* || "$GITHUB_PATH" == *$'\r'* ]]; then
+            echo "GITHUB_PATH is not a safe absolute command-file path" >&2
+            exit 1
+          fi
+          printf '%s\n' "$npm_global_bin" >> "$GITHUB_PATH"
       - run: pnpm install --frozen-lockfile
       - run: pnpm check:quality
       - run: pnpm build

@@ -59,6 +59,34 @@ test("accepts only token-free preparation, minimal OIDC publication, and no-OIDC
   assert.deepEqual(validatePublicationEnvironment(publishEnvironment, publicManifest), []);
 });
 
+test("fails closed unless the reviewed global npm is first on PATH for preparation", () => {
+  assert.equal(workflow.match(/npm_global_prefix="\$\(npm prefix -g\)"/gu)?.length, 1);
+  const mutations = [
+    (source) => source.replace('"$npm_global_prefix" != /*', '"$npm_global_prefix" == ""'),
+    (source) => source.replace('! -x "$npm_global_bin/npm"', '! -e "$npm_global_bin/npm"'),
+    (source) => source.replace('export PATH="$npm_global_bin:$PATH"', 'export PATH="$PATH"'),
+    (source) => source.replace('"$(command -v npm)" != "$npm_global_bin/npm" || ', ""),
+    (source) => source.replace('"$(npm --version)" != "11.19.0"', '"11.19.0" != "11.19.0"'),
+    (source) => source.replace('"$GITHUB_PATH" != /*', '"$GITHUB_PATH" == ""'),
+    (source) =>
+      source.replace(
+        'printf \'%s\\n\' "$npm_global_bin" >> "$GITHUB_PATH"',
+        'printf \'%s\\n\' "$PATH" >> "$GITHUB_PATH"',
+      ),
+    (source) => source.replace("        run: |\n", "        run: >\n"),
+    (source) =>
+      source.replace(
+        "      - run: pnpm install --frozen-lockfile",
+        "      - run: |\n          pnpm install --frozen-lockfile",
+      ),
+  ];
+  for (const mutate of mutations) {
+    const mutated = mutate(workflow);
+    assert.notEqual(mutated, workflow);
+    assert.notDeepEqual(validatePublishNextWorkflow(mutated), []);
+  }
+});
+
 test("rejects changes to every publish trust boundary", () => {
   const mutations = [
     (source) => source.replace("  workflow_dispatch:", "  push:\n    tags:\n      - v*"),

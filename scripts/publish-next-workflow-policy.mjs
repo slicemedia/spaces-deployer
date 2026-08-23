@@ -15,6 +15,8 @@ const sourceProof =
 const npmInstall =
   "npm install --global npm@11.19.0 --ignore-scripts --registry https://registry.npmjs.org/ --userconfig /dev/null";
 const npmVersionProof = 'test "$(npm --version)" = "11.19.0"';
+const reviewedNpmPathProof =
+  'set -euo pipefail\nnpm_global_prefix="$(npm prefix -g)"\nif [[ "$npm_global_prefix" != /* || "$npm_global_prefix" == *:* || "$npm_global_prefix" == *$\'\\n\'* || "$npm_global_prefix" == *$\'\\r\'* ]]; then\n  echo "npm global prefix is not a safe absolute PATH entry" >&2\n  exit 1\nfi\nnpm_global_bin="${npm_global_prefix%/}/bin"\nif [[ ! -d "$npm_global_bin" || ! -x "$npm_global_bin/npm" ]]; then\n  echo "reviewed npm executable was not found in the global npm bin directory" >&2\n  exit 1\nfi\nexport PATH="$npm_global_bin:$PATH"\nif [[ "$(command -v npm)" != "$npm_global_bin/npm" || "$(npm --version)" != "11.19.0" ]]; then\n  echo "reviewed npm 11.19.0 is not first on PATH" >&2\n  exit 1\nfi\nif [[ -z "${GITHUB_PATH:-}" || "$GITHUB_PATH" != /* || "$GITHUB_PATH" == *$\'\\n\'* || "$GITHUB_PATH" == *$\'\\r\'* ]]; then\n  echo "GITHUB_PATH is not a safe absolute command-file path" >&2\n  exit 1\nfi\nprintf \'%s\\n\' "$npm_global_bin" >> "$GITHUB_PATH"\n';
 const publishSourceProof = `${sourceProof} && ${npmVersionProof}`;
 const privateDenylistStep = {
   run: "node scripts/sanitize.mjs",
@@ -57,7 +59,11 @@ const expectedWorkflow = {
           },
         },
         { run: npmInstall },
-        { run: npmVersionProof },
+        {
+          name: "Prefer reviewed npm CLI",
+          shell: "bash",
+          run: reviewedNpmPathProof,
+        },
         { run: "pnpm install --frozen-lockfile" },
         { run: "pnpm check:quality" },
         { run: "pnpm build" },
@@ -172,7 +178,7 @@ export function validatePublishNextWorkflow(source) {
 
   let containsAlias = false;
   let containsFlowCollection = false;
-  let containsMultilineScalar = false;
+  const multilineScalars = [];
   let containsAnchorOrTag = false;
   visit(document, {
     Node(_key, node) {
@@ -184,7 +190,7 @@ export function validatePublishNextWorkflow(source) {
           node.type === "BLOCK_LITERAL" ||
           (typeof node.source === "string" && /[\r\n]/u.test(node.source)))
       ) {
-        containsMultilineScalar = true;
+        multilineScalars.push(node);
       }
       if (("anchor" in node && node.anchor !== undefined) || node.tag !== undefined) {
         containsAnchorOrTag = true;
@@ -194,8 +200,14 @@ export function validatePublishNextWorkflow(source) {
   if (containsAlias) errors.push("Publish workflow YAML aliases are not allowed.");
   if (containsFlowCollection)
     errors.push("Publish workflow flow-style collections are not allowed.");
-  if (containsMultilineScalar) {
-    errors.push("Publish workflow block or multiline scalars are not allowed.");
+  if (
+    multilineScalars.length !== 1 ||
+    multilineScalars[0]?.type !== "BLOCK_LITERAL" ||
+    multilineScalars[0]?.value !== reviewedNpmPathProof
+  ) {
+    errors.push(
+      "Publish workflow block or multiline scalars must contain only the exact reviewed npm PATH proof.",
+    );
   }
   if (containsAnchorOrTag) errors.push("Publish workflow YAML anchors and tags are not allowed.");
 
