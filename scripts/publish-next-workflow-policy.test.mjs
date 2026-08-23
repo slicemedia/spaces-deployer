@@ -262,7 +262,7 @@ test("binds pack output, receipt, source commit, and registry metadata to one ex
           workflow: {
             ref: "refs/heads/main",
             repository: "https://github.com/slicemedia/spaces-deployer",
-            path: "/.github/workflows/publish-next.yml",
+            path: ".github/workflows/publish-next.yml",
           },
         },
         resolvedDependencies: [
@@ -297,6 +297,30 @@ test("binds pack output, receipt, source commit, and registry metadata to one ex
     ),
     [],
   );
+  for (const path of [
+    "/.github/workflows/publish-next.yml",
+    ".github/workflows/publish-next.yml/extra",
+  ]) {
+    const wrongWorkflowPathStatement = JSON.parse(JSON.stringify(statement));
+    wrongWorkflowPathStatement.predicate.buildDefinition.externalParameters.workflow.path = path;
+    const wrongWorkflowPathProvenance = JSON.parse(JSON.stringify(provenance));
+    wrongWorkflowPathProvenance.attestations[0].bundle.dsseEnvelope.payload = Buffer.from(
+      JSON.stringify(wrongWorkflowPathStatement),
+    ).toString("base64");
+    assert.deepEqual(
+      validateProvenanceAttestations(
+        wrongWorkflowPathProvenance,
+        publicManifest.name,
+        publicManifest.version,
+        hashes.integrity,
+        commit,
+      ),
+      [
+        "SLSA provenance does not bind the exact package archive to the expected repository workflow and source commit.",
+      ],
+      `accepted noncanonical workflow path ${path}`,
+    );
+  }
   const attestationUrl = metadata.versions[publicManifest.version].dist.attestations.url;
   const auditReport = {
     invalid: [],
