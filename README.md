@@ -205,6 +205,9 @@ and environment reviewers are active, the bootstrap and trusted publisher are ve
 candidate has passed its final review. The workflow pins npm `11.19.0`, records one archive and its
 integrity before OIDC is available, passes only that archive to the publisher, publishes to the
 explicit npm registry with provenance, and verifies registry integrity afterward.
+The verification job allows npm's publish-time processing up to 18 minutes to settle, then requires
+the exact archive hashes, `next` dist-tag, cryptographically audited SLSA provenance, reviewed
+workflow identity, and release source commit to agree before the release is considered verified.
 
 After the first verified OIDC release, set the package's npm Publishing access to require
 two-factor authentication and disallow tokens. Trusted publishing is additive, so this setting

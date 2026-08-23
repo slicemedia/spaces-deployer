@@ -11,7 +11,15 @@ import {
 } from "./assert-publish-next-safe.mjs";
 import { calculateArchiveHashes, validatePackResult } from "./prepare-npm-publication.mjs";
 import { validatePublishNextWorkflow } from "./publish-next-workflow-policy.mjs";
-import { validatePublicationReceipt, validateRegistryMetadata } from "./verify-npm-publication.mjs";
+import {
+  registryAvailabilityWindowMilliseconds,
+  registryPollIntervalMilliseconds,
+  validateNpmAuditReport,
+  validateProvenanceAttestations,
+  validatePublicationReceipt,
+  validateRegistryMetadata,
+  waitForPublicationAvailability,
+} from "./verify-npm-publication.mjs";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workflow = await readFile(
@@ -102,6 +110,7 @@ test("rejects changes to every publish trust boundary", () => {
     (source) => source.replace("fetch-depth: 0", "fetch-depth: 1"),
     (source) => source.replace("runtime: node@24", "runtime: node@latest"),
     (source) => source.replace("npm@11.19.0", "npm@12.0.0"),
+    (source) => source.replace("timeout-minutes: 25", "timeout-minutes: 10"),
     (source) =>
       source.replace("${{ secrets.SLICEMEDIA_FORBIDDEN_TERMS }}", "${{ secrets.UNRELATED_VALUE }}"),
     (source) => source.replace('= "11.19.0"', '= "11.19.1"'),
@@ -204,6 +213,10 @@ test("binds pack output, receipt, source commit, and registry metadata to one ex
         dist: {
           ...hashes,
           tarball: "https://registry.npmjs.org/example.tgz",
+          attestations: {
+            url: `https://registry.npmjs.org/-/npm/v1/attestations/%40slicemedia%2fspaces-deployer@${publicManifest.version}`,
+            provenance: { predicateType: "https://slsa.dev/provenance/v1" },
+          },
         },
       },
     },
@@ -216,6 +229,118 @@ test("binds pack output, receipt, source commit, and registry metadata to one ex
       publicManifest.version,
       hashes.integrity,
       hashes.shasum,
+    ),
+    [],
+  );
+  const statement = {
+    _type: "https://in-toto.io/Statement/v1",
+    subject: [
+      {
+        name: `pkg:npm/%40slicemedia/spaces-deployer@${publicManifest.version}`,
+        digest: {
+          sha512: Buffer.from(hashes.integrity.slice("sha512-".length), "base64").toString("hex"),
+        },
+      },
+    ],
+    predicateType: "https://slsa.dev/provenance/v1",
+    predicate: {
+      buildDefinition: {
+        buildType: "https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1",
+        externalParameters: {
+          workflow: {
+            ref: "refs/heads/main",
+            repository: "https://github.com/slicemedia/spaces-deployer",
+            path: "/.github/workflows/publish-next.yml",
+          },
+        },
+        resolvedDependencies: [
+          {
+            uri: "git+https://github.com/slicemedia/spaces-deployer@refs/heads/main",
+            digest: { gitCommit: commit },
+          },
+        ],
+      },
+    },
+  };
+  const provenance = {
+    attestations: [
+      {
+        predicateType: "https://slsa.dev/provenance/v1",
+        bundle: {
+          dsseEnvelope: {
+            payloadType: "application/vnd.in-toto+json",
+            payload: Buffer.from(JSON.stringify(statement)).toString("base64"),
+          },
+        },
+      },
+    ],
+  };
+  assert.deepEqual(
+    validateProvenanceAttestations(
+      provenance,
+      publicManifest.name,
+      publicManifest.version,
+      hashes.integrity,
+      commit,
+    ),
+    [],
+  );
+  const attestationUrl = metadata.versions[publicManifest.version].dist.attestations.url;
+  const auditReport = {
+    invalid: [],
+    missing: [],
+    verified: [
+      {
+        name: publicManifest.name,
+        version: publicManifest.version,
+        registry: "https://registry.npmjs.org/",
+        attestations: {
+          url: attestationUrl,
+          provenance: { predicateType: "https://slsa.dev/provenance/v1" },
+        },
+      },
+    ],
+  };
+  assert.deepEqual(
+    validateNpmAuditReport(
+      auditReport,
+      publicManifest.name,
+      publicManifest.version,
+      attestationUrl,
+    ),
+    [],
+  );
+  const wrongCommitStatement = JSON.parse(JSON.stringify(statement));
+  wrongCommitStatement.predicate.buildDefinition.resolvedDependencies[0].digest.gitCommit =
+    "b".repeat(40);
+  assert.notDeepEqual(
+    validateProvenanceAttestations(
+      {
+        attestations: [
+          {
+            predicateType: "https://slsa.dev/provenance/v1",
+            bundle: {
+              dsseEnvelope: {
+                payloadType: "application/vnd.in-toto+json",
+                payload: Buffer.from(JSON.stringify(wrongCommitStatement)).toString("base64"),
+              },
+            },
+          },
+        ],
+      },
+      publicManifest.name,
+      publicManifest.version,
+      hashes.integrity,
+      commit,
+    ),
+    [],
+  );
+  assert.notDeepEqual(
+    validateNpmAuditReport(
+      { ...auditReport, invalid: [{ name: "synthetic-invalid-package" }] },
+      publicManifest.name,
+      publicManifest.version,
+      attestationUrl,
     ),
     [],
   );
@@ -247,4 +372,55 @@ test("binds pack output, receipt, source commit, and registry metadata to one ex
     ),
     [],
   );
+});
+
+test("polls immediately at a fixed gentle cadence within the bounded availability window", async () => {
+  assert.equal(registryPollIntervalMilliseconds, 15_000);
+  assert.equal(registryAvailabilityWindowMilliseconds, 18 * 60_000);
+
+  let clock = 0;
+  const inspectionTimes = [];
+  const delays = [];
+  const result = await waitForPublicationAvailability(
+    async () => {
+      inspectionTimes.push(clock);
+      if (inspectionTimes.length < 3) throw new Error("publication is still processing");
+      return "verified";
+    },
+    {
+      availabilityWindowMilliseconds: 30_000,
+      logger() {},
+      now: () => clock,
+      pollIntervalMilliseconds: 15_000,
+      sleep: async (milliseconds) => {
+        delays.push(milliseconds);
+        clock += milliseconds;
+      },
+    },
+  );
+  assert.equal(result, "verified");
+  assert.deepEqual(inspectionTimes, [0, 15_000, 30_000]);
+  assert.deepEqual(delays, [15_000, 15_000]);
+
+  clock = 0;
+  let attempts = 0;
+  await assert.rejects(
+    waitForPublicationAvailability(
+      async () => {
+        attempts += 1;
+        throw new Error("publication is still processing");
+      },
+      {
+        availabilityWindowMilliseconds: 30_000,
+        logger() {},
+        now: () => clock,
+        pollIntervalMilliseconds: 15_000,
+        sleep: async (milliseconds) => {
+          clock += milliseconds;
+        },
+      },
+    ),
+    /did not become fully verifiable/u,
+  );
+  assert.equal(attempts, 3);
 });

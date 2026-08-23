@@ -115,6 +115,7 @@ jobs:
       - publish
     if: github.repository == 'slicemedia/spaces-deployer' && github.event.repository.private == false && github.ref == 'refs/heads/main' && vars.SLICEMEDIA_NPM_PUBLISH_NEXT_ENABLED == 'true' && needs.prepare.result == 'success' && needs.publish.result == 'success'
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     permissions:
       contents: read
     steps:
@@ -127,6 +128,8 @@ jobs:
         with:
           node-version: 24
           check-latest: false
+      - run: npm install --global npm@11.19.0 --ignore-scripts --registry https://registry.npmjs.org/ --userconfig /dev/null
+      - run: test "$(npm --version)" = "11.19.0"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: npm-package-${{ github.sha }}
