@@ -26,15 +26,15 @@ function runGuard(overrides: NodeJS.ProcessEnv = {}) {
   });
 }
 
-describe("private release preparation guard", () => {
-  it("accepts version-PR-only preparation for the private repository", () => {
+describe("release preparation guard", () => {
+  it("accepts publication-disabled preparation with explicit private visibility", () => {
     const result = runGuard();
 
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("npm publication is disabled");
   });
 
-  it("accepts version-PR-only preparation for the public repository", () => {
+  it("accepts publication-disabled preparation with explicit public visibility", () => {
     const result = runGuard({ GITHUB_REPOSITORY_VISIBILITY: "public" });
 
     expect(result.status).toBe(0);
