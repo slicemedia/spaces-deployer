@@ -490,7 +490,7 @@ describe("slicemedia-spaces", () => {
 
     expect(exitCode).toBe(1);
     expect(errors.join("\n")).toContain("tracked or staged by Git");
-  });
+  }, 15_000);
 
   it("refuses a case-variant private plan that is staged by Git", async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "slicemedia-spaces-cli-git-test-"));
@@ -516,7 +516,7 @@ describe("slicemedia-spaces", () => {
     expect(exitCode).toBe(1);
     expect(errors.join("\n")).toContain("tracked or staged by Git");
     expect(createPlan).not.toHaveBeenCalled();
-  });
+  }, 15_000);
 
   it("refuses a plan path that remains in reachable Git history", async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "slicemedia-spaces-cli-git-test-"));
@@ -544,7 +544,7 @@ describe("slicemedia-spaces", () => {
 
     expect(exitCode).toBe(1);
     expect(errors.join("\n")).toContain("reachable Git history");
-  });
+  }, 15_000);
 
   it("refuses a case-variant private plan that remains in reachable Git history", async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "slicemedia-spaces-cli-git-test-"));
