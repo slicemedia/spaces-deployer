@@ -783,7 +783,11 @@ function normalizeTarget(input: {
 
 function normalizePrefix(value: string): string {
   if (value.includes("\\")) throw new Error("prefix must use forward slashes.");
-  const normalized = value.replace(/^\/+|\/+$/gu, "");
+  let start = 0;
+  while (start < value.length && value[start] === "/") start += 1;
+  let end = value.length;
+  while (end > start && value[end - 1] === "/") end -= 1;
+  const normalized = value.slice(start, end);
   if (normalized === "") throw new Error("prefix must contain at least one safe path segment.");
   for (const segment of normalized.split("/")) validatePathSegment(segment, "prefix segment");
   return normalized;
