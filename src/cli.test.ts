@@ -60,6 +60,8 @@ describe("slicemedia-spaces", () => {
     const exitCode = await runSpacesCli(
       [
         "plan",
+        "--mode",
+        "immutable",
         "--directory",
         "dist",
         "--endpoint",
@@ -87,6 +89,7 @@ describe("slicemedia-spaces", () => {
       bucket: "neutral-assets",
       prefix: "releases",
       releaseVersion: "release-1",
+      mode: "immutable",
     });
     const absolutePlanPath = path.join(cwd, privatePlanPath);
     expect(JSON.parse(await readFile(absolutePlanPath, "utf8"))).toEqual(plan);
@@ -118,6 +121,87 @@ describe("slicemedia-spaces", () => {
 
     expect(errors).toEqual([]);
     expect(exitCode).toBe(0);
+  });
+
+  it("plans stable URLs by default and supplies the CDN token only during apply", async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "slicemedia-spaces-stable-cli-"));
+    temporaryDirectories.push(cwd);
+    await mkdir(path.join(cwd, "dist"));
+    await writeFile(path.join(cwd, "dist", "project.js"), "console.info('neutral');\n");
+    const argv = planArguments();
+    argv.splice(argv.indexOf("--mode"), 2);
+    argv[argv.indexOf("--prefix") + 1] = "project/assets";
+    argv.push("--cdn-endpoint-id", "12345678-1234-1234-1234-123456789abc", "--json");
+    const output: string[] = [];
+    const env = {
+      DIGITALOCEAN_SPACES_ACCESS_KEY_ID: "test-access",
+      DIGITALOCEAN_SPACES_SECRET_ACCESS_KEY: "test-secret",
+      DIGITALOCEAN_TOKEN: "test-cdn-token",
+    };
+    expect(await runSpacesCli(argv, { cwd, env, writer: collectingWriter(output) })).toBe(0);
+    const plan = JSON.parse(
+      await readFile(path.join(cwd, privatePlanPath), "utf8"),
+    ) as SpacesDeploymentPlan;
+    expect(plan).toMatchObject({
+      schemaVersion: 3,
+      mode: "stable",
+      cdn: { files: ["/project/assets/*"] },
+    });
+    expect(plan.files[0]?.key).toBe("project/assets/project.js");
+    expect(JSON.stringify(plan)).not.toContain(env.DIGITALOCEAN_TOKEN);
+    expect(output.join("\n")).not.toContain(env.DIGITALOCEAN_TOKEN);
+    const receipt = {
+      ...sampleReceipt(plan),
+      schemaVersion: 3,
+      mode: "stable",
+      cdn: { status: "requested" },
+    };
+    const applyPlan = vi.fn().mockResolvedValue(receipt);
+    output.length = 0;
+    expect(
+      await runSpacesCli(["apply", "--plan", privatePlanPath, "--plan-id", plan.planId, "--yes"], {
+        cwd,
+        env,
+        applyPlan,
+        writer: collectingWriter(output),
+      }),
+    ).toBe(0);
+    expect(applyPlan).toHaveBeenCalledWith(plan, {
+      confirmedPlanId: plan.planId,
+      credentials: { accessKeyId: "test-access", secretAccessKey: "test-secret" },
+      cdnApiToken: env.DIGITALOCEAN_TOKEN,
+    });
+    expect(output.join("\n")).toContain("CDN purge requested");
+    expect(output.join("\n")).not.toContain(env.DIGITALOCEAN_TOKEN);
+    const errors: string[] = [];
+    expect(
+      await runSpacesCli(["apply", "--plan", privatePlanPath, "--plan-id", plan.planId, "--yes"], {
+        cwd,
+        env: {
+          DIGITALOCEAN_SPACES_ACCESS_KEY_ID: "test-access",
+          DIGITALOCEAN_SPACES_SECRET_ACCESS_KEY: "test-secret",
+        },
+        writer: collectingWriter([], errors),
+      }),
+    ).toBe(1);
+    expect(errors.join("\n")).toContain("CDN API token");
+  });
+
+  it("rejects missing CDN configuration and unsupported mode combinations", async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "slicemedia-spaces-cli-mode-"));
+    temporaryDirectories.push(cwd);
+    const createPlan = vi.fn();
+    const noMode = planArguments();
+    noMode.splice(noMode.indexOf("--mode"), 2);
+    for (const argv of [
+      noMode,
+      [...planArguments(), "--cdn-endpoint-id", "12345678-1234-1234-1234-123456789abc"],
+      [...noMode, "--mode", "unknown"],
+      [...noMode, "--cdn-api-token", "test-cdn-token"],
+    ]) {
+      expect(await runSpacesCli(argv, { cwd, createPlan, writer: collectingWriter([]) })).toBe(1);
+    }
+    expect(createPlan).not.toHaveBeenCalled();
   });
 
   it("requires --yes and the exact plan ID before invoking apply", async () => {
@@ -646,6 +730,8 @@ describe("slicemedia-spaces", () => {
 function planArguments(): string[] {
   return [
     "plan",
+    "--mode",
+    "immutable",
     "--directory",
     "dist",
     "--endpoint",

@@ -11,16 +11,26 @@ import {
 } from "@aws-sdk/client-s3";
 
 import {
+  createCdnPurge,
+  requestCdnPurge,
+  STABLE_CACHE_CONTROL,
+  validateCdnToken,
+  verifyCdnEndpoint,
+} from "./cdn.js";
+import {
   SpacesDeploymentError,
   type ApplyDeploymentPlanOptions,
   type CreateDeploymentPlanOptions,
   type SpacesCredentials,
+  type SpacesCdnPurgeReceipt,
   type SpacesDeploymentFile,
   type SpacesDeploymentFileReceipt,
   type SpacesDeploymentLimits,
   type SpacesDeploymentPlan,
   type SpacesDeploymentReceipt,
   type SpacesDeploymentTarget,
+  type SpacesImmutableDeploymentPlan,
+  type SpacesStableDeploymentPlan,
 } from "./types.js";
 
 export const SPACES_DEPLOYMENT_LIMITS: SpacesDeploymentLimits = Object.freeze({
@@ -42,8 +52,11 @@ interface FileMetadata {
 }
 
 type RemoteFileDecision =
-  | { readonly action: "upload" }
+  | { readonly action: "upload"; readonly previousVersionId?: string }
   | { readonly action: "skip"; readonly etag?: string; readonly versionId: string };
+
+type UnsignedPlan =
+  Omit<SpacesImmutableDeploymentPlan, "planId"> | Omit<SpacesStableDeploymentPlan, "planId">;
 
 export async function createDeploymentPlan(
   options: CreateDeploymentPlanOptions,
@@ -51,6 +64,22 @@ export async function createDeploymentPlan(
   const sourceDirectory = path.resolve(options.directory);
   const target = normalizeTarget(options);
   const releaseVersion = validateReleaseVersion(options.releaseVersion);
+  const mode = options.mode ?? "stable";
+  if (mode !== "stable" && mode !== "immutable") {
+    throw new Error("Deployment mode must be stable or immutable.");
+  }
+  if (mode === "immutable" && options.cdnEndpointId !== undefined) {
+    throw new Error("CDN invalidation is only supported for stable deployments.");
+  }
+  const delivery =
+    mode === "stable"
+      ? {
+          schemaVersion: 3 as const,
+          mode: "stable" as const,
+          cacheControl: STABLE_CACHE_CONTROL,
+          cdn: createCdnPurge(options.cdnEndpointId, target.prefix),
+        }
+      : { schemaVersion: 2 as const };
   const relativePaths = await listFiles(sourceDirectory);
   if (relativePaths.length === 0) {
     throw new Error("Deployment directory contains no files.");
@@ -86,10 +115,16 @@ export async function createDeploymentPlan(
   const artifactSetDigest = calculateArtifactSetDigest(metadata);
   const files: SpacesDeploymentFile[] = metadata.map((file) => ({
     ...file,
-    key: objectKey(target.prefix, releaseVersion, artifactSetDigest, file.relativePath),
+    key: objectKey(
+      target.prefix,
+      releaseVersion,
+      artifactSetDigest,
+      file.relativePath,
+      mode === "stable",
+    ),
   }));
   const unsignedPlan = {
-    schemaVersion: 2 as const,
+    ...delivery,
     sourceDirectory,
     target,
     releaseVersion,
@@ -108,6 +143,8 @@ export async function applyDeploymentPlan(
     throw new Error("confirmedPlanId must exactly match the deployment plan ID.");
   }
   const credentials = validateCredentials(options.credentials);
+  const cdnToken =
+    validatedPlan.schemaVersion === 3 ? validateCdnToken(options.cdnApiToken) : undefined;
   const timestamp = (options.now ?? (() => new Date()))().toISOString();
   const contents = await preflightContents(validatedPlan);
   const client =
@@ -121,6 +158,13 @@ export async function applyDeploymentPlan(
       responseChecksumValidation: "WHEN_REQUIRED",
     });
 
+  if (validatedPlan.schemaVersion === 3 && cdnToken !== undefined) {
+    try {
+      await verifyCdnEndpoint(validatedPlan, cdnToken, options.cdnFetch ?? fetch);
+    } catch (error) {
+      failDeployment(validatedPlan, timestamp, redactError(error, credentials, [cdnToken]), []);
+    }
+  }
   await assertBucketVersioning(client, validatedPlan, timestamp, credentials);
   const decisions = await preflightRemoteFiles(client, validatedPlan, timestamp, credentials);
   const receipts: SpacesDeploymentFileReceipt[] = [];
@@ -163,7 +207,7 @@ export async function applyDeploymentPlan(
           Body: body,
           ContentLength: file.size,
           ContentType: file.contentType,
-          CacheControl: IMMUTABLE_CACHE_CONTROL,
+          CacheControl: cacheControl(validatedPlan),
           Metadata: {
             sha384: file.sha384,
             "artifact-set-digest": validatedPlan.artifactSetDigest,
@@ -178,7 +222,14 @@ export async function applyDeploymentPlan(
       );
       const failed = [
         ...receipts,
-        { key: file.key, status: "failed" as const, error: errorMessage },
+        {
+          key: file.key,
+          status: "failed" as const,
+          error: errorMessage,
+          ...(decision.previousVersionId === undefined
+            ? {}
+            : { previousVersionId: decision.previousVersionId }),
+        },
       ];
       failDeployment(validatedPlan, timestamp, `Versioned upload failed: ${errorMessage}`, failed);
     }
@@ -196,6 +247,9 @@ export async function applyDeploymentPlan(
             status: "failed",
             ...(response.ETag === undefined ? {} : { etag: response.ETag }),
             error: "missing-upload-version-id",
+            ...(decision.previousVersionId === undefined
+              ? {}
+              : { previousVersionId: decision.previousVersionId }),
           },
         ],
       );
@@ -209,15 +263,37 @@ export async function applyDeploymentPlan(
       timestamp,
       credentials,
       receipts,
+      decision.previousVersionId,
     );
     receipts.push({
       key: file.key,
       status: "uploaded",
       ...(response.ETag === undefined ? {} : { etag: response.ETag }),
       versionId,
+      ...(decision.previousVersionId === undefined
+        ? {}
+        : { previousVersionId: decision.previousVersionId }),
     });
   }
 
+  if (validatedPlan.schemaVersion === 3 && cdnToken !== undefined) {
+    await verifyCurrentFiles(client, validatedPlan, timestamp, credentials, receipts);
+    try {
+      // Retry invalidation even when a prior attempt uploaded every file already.
+      await requestCdnPurge(validatedPlan, cdnToken, options.cdnFetch ?? fetch);
+    } catch (error) {
+      const errorMessage = redactError(error, credentials, [cdnToken]);
+      failDeployment(validatedPlan, timestamp, errorMessage, receipts, {
+        ...validatedPlan.cdn,
+        status: "failed",
+        error: errorMessage,
+      });
+    }
+    return deploymentReceipt(validatedPlan, timestamp, "applied", receipts, {
+      ...validatedPlan.cdn,
+      status: "requested",
+    });
+  }
   return deploymentReceipt(validatedPlan, timestamp, "applied", receipts);
 }
 
@@ -230,6 +306,7 @@ async function verifyUploadedFile(
   timestamp: string,
   credentials: SpacesCredentials,
   completedReceipts: readonly SpacesDeploymentFileReceipt[],
+  previousVersionId?: string,
 ): Promise<void> {
   let response;
   try {
@@ -249,6 +326,7 @@ async function verifyUploadedFile(
         status: "failed",
         ...(etag === undefined ? {} : { etag }),
         versionId,
+        ...(previousVersionId === undefined ? {} : { previousVersionId }),
         error: `post-upload-verification-error: ${errorMessage}`,
       },
     ]);
@@ -266,6 +344,7 @@ async function verifyUploadedFile(
           status: "failed",
           ...(etag === undefined ? {} : { etag }),
           versionId,
+          ...(previousVersionId === undefined ? {} : { previousVersionId }),
           error: "post-upload-verification-mismatch",
         },
       ],
@@ -319,7 +398,7 @@ async function preflightRemoteFiles(
       const response = await client.send(
         new HeadObjectCommand({ Bucket: plan.target.bucket, Key: file.key }),
       );
-      if (!remoteFileMatches(response, plan, file)) {
+      if (!remoteFileMatches(response, plan, file) && plan.schemaVersion === 2) {
         failDeployment(
           plan,
           timestamp,
@@ -335,6 +414,10 @@ async function preflightRemoteFiles(
           "A matching object did not include an immutable version ID.",
           [{ key: file.key, status: "failed", error: "existing-object-missing-version-id" }],
         );
+      }
+      if (!remoteFileMatches(response, plan, file)) {
+        decisions.push({ action: "upload", previousVersionId: versionId });
+        continue;
       }
       decisions.push({
         action: "skip",
@@ -375,10 +458,49 @@ function remoteFileMatches(
   return (
     response.ContentLength === file.size &&
     response.ContentType === file.contentType &&
-    response.CacheControl === IMMUTABLE_CACHE_CONTROL &&
+    response.CacheControl === cacheControl(plan) &&
     response.Metadata?.sha384 === file.sha384 &&
     response.Metadata["artifact-set-digest"] === plan.artifactSetDigest
   );
+}
+
+function cacheControl(plan: SpacesDeploymentPlan): string {
+  return plan.schemaVersion === 3 ? plan.cacheControl : IMMUTABLE_CACHE_CONTROL;
+}
+
+async function verifyCurrentFiles(
+  client: S3Client,
+  plan: SpacesStableDeploymentPlan,
+  timestamp: string,
+  credentials: SpacesCredentials,
+  receipts: readonly SpacesDeploymentFileReceipt[],
+): Promise<void> {
+  for (const [index, file] of plan.files.entries()) {
+    let errorMessage: string | undefined;
+    try {
+      const response = await client.send(
+        new HeadObjectCommand({ Bucket: plan.target.bucket, Key: file.key }),
+      );
+      if (
+        response.VersionId !== receipts[index]?.versionId ||
+        !remoteFileMatches(response, plan, file)
+      ) {
+        errorMessage = "current-version-mismatch";
+      }
+    } catch (error) {
+      errorMessage = redactError(error, credentials, deploymentSensitiveValues(plan, file));
+    }
+    if (errorMessage !== undefined) {
+      failDeployment(
+        plan,
+        timestamp,
+        "The current stable object could not be verified before CDN invalidation.",
+        receipts.map((receipt, receiptIndex) =>
+          receiptIndex === index ? { ...receipt, status: "failed", error: errorMessage } : receipt,
+        ),
+      );
+    }
+  }
 }
 
 function deploymentReceipt(
@@ -386,9 +508,16 @@ function deploymentReceipt(
   timestamp: string,
   status: SpacesDeploymentReceipt["status"],
   files: readonly SpacesDeploymentFileReceipt[],
+  cdn?: SpacesCdnPurgeReceipt,
 ): SpacesDeploymentReceipt {
   return {
-    schemaVersion: 2,
+    ...(plan.schemaVersion === 3
+      ? {
+          schemaVersion: 3 as const,
+          mode: "stable" as const,
+          cdn: cdn ?? { ...plan.cdn, status: "not-requested" as const },
+        }
+      : { schemaVersion: 2 as const }),
     operation: "slicemedia.spaces-deployer.deploy",
     status,
     planId: plan.planId,
@@ -405,9 +534,13 @@ function failDeployment(
   timestamp: string,
   message: string,
   files: readonly SpacesDeploymentFileReceipt[],
+  cdn?: SpacesCdnPurgeReceipt,
 ): never {
   // Provider errors are reduced to redacted strings before reaching this boundary.
-  throw new SpacesDeploymentError(message, deploymentReceipt(plan, timestamp, "failed", files));
+  throw new SpacesDeploymentError(
+    message,
+    deploymentReceipt(plan, timestamp, "failed", files, cdn),
+  );
 }
 
 async function preflightContents(plan: SpacesDeploymentPlan): Promise<readonly Uint8Array[]> {
@@ -426,6 +559,10 @@ async function preflightContents(plan: SpacesDeploymentPlan): Promise<readonly U
 }
 
 function validatePlan(input: SpacesDeploymentPlan): SpacesDeploymentPlan {
+  const stable =
+    typeof input === "object" &&
+    input !== null &&
+    Object.getOwnPropertyDescriptor(input, "schemaVersion")?.value === 3;
   const plan = exactRecord(
     input,
     [
@@ -436,10 +573,13 @@ function validatePlan(input: SpacesDeploymentPlan): SpacesDeploymentPlan {
       "schemaVersion",
       "sourceDirectory",
       "target",
+      ...(stable ? ["mode", "cacheControl", "cdn"] : []),
     ],
     "deployment plan",
   );
-  if (plan.schemaVersion !== 2) throw new Error("Unsupported Spaces deployment plan schema.");
+  if (plan.schemaVersion !== 2 && plan.schemaVersion !== 3) {
+    throw new Error("Unsupported Spaces deployment plan schema.");
+  }
 
   const planId = stringField(plan, "planId", "deployment plan");
   const sourceDirectory = stringField(plan, "sourceDirectory", "deployment plan");
@@ -467,6 +607,9 @@ function validatePlan(input: SpacesDeploymentPlan): SpacesDeploymentPlan {
   ) {
     throw new Error("Deployment plan target must contain exact canonical values.");
   }
+  const delivery = stable
+    ? validateStableDelivery(plan, target.prefix)
+    : { schemaVersion: 2 as const };
 
   const inputReleaseVersion = stringField(plan, "releaseVersion", "deployment plan");
   const releaseVersion = validateReleaseVersion(inputReleaseVersion);
@@ -516,7 +659,9 @@ function validatePlan(input: SpacesDeploymentPlan): SpacesDeploymentPlan {
   for (const file of files) {
     const { relativePath } = file;
     if (seenKeys.has(file.key)) throw new Error("Deployment plan contains duplicate object keys.");
-    if (file.key !== objectKey(target.prefix, releaseVersion, artifactSetDigest, relativePath)) {
+    if (
+      file.key !== objectKey(target.prefix, releaseVersion, artifactSetDigest, relativePath, stable)
+    ) {
       throw new Error("Deployment plan contains an unexpected object key.");
     }
     seenKeys.add(file.key);
@@ -527,7 +672,7 @@ function validatePlan(input: SpacesDeploymentPlan): SpacesDeploymentPlan {
     throw new Error("Deployment artifact-set digest does not match its files.");
   }
   const expected = calculatePlanId({
-    schemaVersion: 2,
+    ...delivery,
     sourceDirectory,
     target,
     releaseVersion,
@@ -536,13 +681,36 @@ function validatePlan(input: SpacesDeploymentPlan): SpacesDeploymentPlan {
   });
   if (planId !== expected) throw new Error("Deployment plan ID does not match its contents.");
   return {
-    schemaVersion: 2,
+    ...delivery,
     planId,
     sourceDirectory,
     target,
     releaseVersion,
     artifactSetDigest,
     files,
+  };
+}
+
+function validateStableDelivery(plan: Readonly<Record<string, unknown>>, prefix: string) {
+  if (plan.mode !== "stable" || plan.cacheControl !== STABLE_CACHE_CONTROL) {
+    throw new Error("Stable deployment mode and cache policy must match the supported values.");
+  }
+  const inputCdn = exactRecord(plan.cdn, ["endpointId", "files"], "CDN purge");
+  const endpointId = stringField(inputCdn, "endpointId", "CDN purge");
+  const cdn = createCdnPurge(endpointId, prefix);
+  if (
+    endpointId !== cdn.endpointId ||
+    !Array.isArray(inputCdn.files) ||
+    inputCdn.files.length !== 1 ||
+    inputCdn.files[0] !== cdn.files[0]
+  ) {
+    throw new Error("CDN purge must contain only the exact dedicated deployment prefix.");
+  }
+  return {
+    schemaVersion: 3 as const,
+    mode: "stable" as const,
+    cacheControl: STABLE_CACHE_CONTROL,
+    cdn,
   };
 }
 
@@ -558,7 +726,7 @@ function calculateArtifactSetDigest(files: readonly FileMetadata[]): string {
   return `sha256-${createHash("sha256").update(canonical).digest("hex")}`;
 }
 
-function calculatePlanId(plan: Omit<SpacesDeploymentPlan, "planId">): string {
+function calculatePlanId(plan: UnsignedPlan): string {
   const canonical = JSON.stringify({
     schemaVersion: plan.schemaVersion,
     target: plan.target,
@@ -571,6 +739,9 @@ function calculatePlanId(plan: Omit<SpacesDeploymentPlan, "planId">): string {
       sha384: file.sha384,
       contentType: file.contentType,
     })),
+    ...(plan.schemaVersion === 3
+      ? { mode: plan.mode, cacheControl: plan.cacheControl, cdn: plan.cdn }
+      : {}),
   });
   return `spaces-${createHash("sha256").update(canonical).digest("hex")}`;
 }
@@ -849,7 +1020,9 @@ function objectKey(
   releaseVersion: string,
   artifactSetDigest: string,
   relativePath: string,
+  stable = false,
 ): string {
+  if (stable) return [prefix, relativePath].join("/");
   return [prefix, releaseVersion, artifactSetDigest, relativePath].join("/");
 }
 

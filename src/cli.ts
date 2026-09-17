@@ -124,7 +124,8 @@ async function dispatch(
       command: "help",
       summary: "Slice Media Spaces Deployer commands",
       data: [
-        "plan --directory <dir> --endpoint <url> --region <region> --bucket <bucket> --prefix <prefix> --release-version <version> --plan .slicemedia/spaces-deployer/<file>.json",
+        "plan --directory <dir> --endpoint <url> --region <region> --bucket <bucket> --prefix <project/assets> --release-version <version> --cdn-endpoint-id <uuid> --plan .slicemedia/spaces-deployer/<file>.json",
+        "Stable URLs and scoped CDN invalidation are the default. Use --mode immutable without --cdn-endpoint-id for content-addressed releases.",
         "apply --plan .slicemedia/spaces-deployer/<file>.json --plan-id <id> --yes",
       ],
     };
@@ -132,13 +133,30 @@ async function dispatch(
 
   if (command === "plan") {
     assertCommandShape(args, {
-      options: ["bucket", "directory", "endpoint", "plan", "prefix", "region", "release-version"],
+      options: [
+        "bucket",
+        "directory",
+        "endpoint",
+        "plan",
+        "prefix",
+        "region",
+        "release-version",
+        "mode",
+        "cdn-endpoint-id",
+      ],
       flags: ["json"],
     });
     const planPath = resolvePlanPath(context.cwd, requireOption(args, "plan"));
     const storage = await preparePrivatePlanStorage(context.cwd, planPath);
     const prefix = args.options.get("prefix");
     if (prefix === undefined || prefix.trim() === "") throw new Error("Provide --prefix.");
+    const mode = args.options.get("mode") ?? "stable";
+    if (mode !== "stable" && mode !== "immutable")
+      throw new Error("--mode must be stable or immutable.");
+    const cdnEndpointId = mode === "stable" ? requireOption(args, "cdn-endpoint-id") : undefined;
+    if (mode === "immutable" && args.options.has("cdn-endpoint-id")) {
+      throw new Error("--cdn-endpoint-id is only supported with stable deployments.");
+    }
     const options: CreateDeploymentPlanOptions = {
       directory: path.resolve(context.cwd, requireOption(args, "directory")),
       endpoint: requireOption(args, "endpoint"),
@@ -146,6 +164,8 @@ async function dispatch(
       bucket: requireOption(args, "bucket"),
       prefix,
       releaseVersion: requireOption(args, "release-version"),
+      mode,
+      ...(cdnEndpointId === undefined ? {} : { cdnEndpointId }),
     };
     const plan = await context.createPlan(options);
     await writePlan(storage, plan);
@@ -159,7 +179,7 @@ async function dispatch(
     return {
       ok: true,
       command: "plan",
-      summary: `Planned ${plan.files.length} content-addressed object(s) as ${plan.planId}.`,
+      summary: `Planned ${plan.files.length} ${plan.schemaVersion === 3 ? "stable-URL object(s) and scoped CDN invalidation" : "content-addressed object(s)"} as ${plan.planId}.`,
       data: { plan },
     };
   }
@@ -175,14 +195,20 @@ async function dispatch(
     const storage = await preparePrivatePlanStorage(context.cwd, planPath);
     const plan = JSON.parse(await readPrivatePlan(storage)) as SpacesDeploymentPlan;
     const credentials = credentialsFromEnvironment(context.env);
-    const applyOptions: ApplyDeploymentPlanOptions = { confirmedPlanId, credentials };
+    const applyOptions: ApplyDeploymentPlanOptions = {
+      confirmedPlanId,
+      credentials,
+      ...(plan.schemaVersion === 3 && context.env.DIGITALOCEAN_TOKEN !== undefined
+        ? { cdnApiToken: context.env.DIGITALOCEAN_TOKEN }
+        : {}),
+    };
     const receipt = await context.applyPlan(plan, applyOptions);
     const uploaded = receipt.files.filter((file) => file.status === "uploaded").length;
     const skipped = receipt.files.filter((file) => file.status === "skipped").length;
     return {
       ok: true,
       command: "apply",
-      summary: `Uploaded ${uploaded} versioned object(s); skipped ${skipped} matching object(s).`,
+      summary: `Uploaded ${uploaded} versioned object(s); skipped ${skipped} matching object(s).${receipt.schemaVersion === 3 ? " CDN purge requested." : ""}`,
       data: receipt,
     };
   }

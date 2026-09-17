@@ -25,13 +25,26 @@ storage and same-user process boundary independently.
 
 Before a release, run `pnpm check` and inspect the `npm pack --dry-run` manifest. Never weaken
 mandatory bucket versioning, complete remote HEAD preflight, exact-version post-upload read-back,
-nonempty provider version IDs, digest-derived namespaces, resource limits, private plan storage,
+nonempty provider version IDs, mode-specific key validation, resource limits, private plan storage,
 exact plan validation, local drift checks, or credential redaction without a reviewed breaking
 change and adversarial tests.
 
 The HEAD-to-PUT interval is not atomic. Bucket versioning limits damage from a racing writer by retaining prior versions; it does not provide mutual exclusion or an atomic create-only write.
 
-The package does not manage public access, bucket policy, ACL, CORS, CDN, domains, or Webflow
-publishing. Treat those as separate reviewed operations. Read-back validates provider metadata for
+Stable schema-v3 plans authorize replacement only of their listed keys under a dedicated prefix.
+They bind the cache policy, CDN endpoint ID and derived prefix purge to the plan ID. Before writing,
+the CDN origin must match the Spaces target. Purging occurs only after successful upload read-back
+and a check that the planned versions are current. The only DELETE operation targets the CDN
+endpoint's `/cache` resource, never stored objects or the endpoint itself. CDN API tokens are
+supplied separately during apply, never serialized, and never forwarded through redirects.
+Provider response bodies and raw CDN transport errors are not included in diagnostics. A failed
+purge leaves the uploads recorded in a failed receipt; reapplying retries invalidation.
+
+Immutable schema-v2 plans retain their digest-derived namespaces and reject occupied mismatches.
+The default mode change does not reinterpret saved plans. Stable plans require adversarial tests
+for scope expansion, plan tampering, mismatched origins, partial writes and purge failures.
+
+The package does not manage public access, bucket policy, ACL, CORS, CDN configuration, domains, or
+Webflow publishing. Treat those as separate reviewed operations. Read-back validates provider metadata for
 the exact uploaded version; it is not a remote-body hash or a defense against a malicious storage
 administrator.
