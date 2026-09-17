@@ -565,7 +565,7 @@ describe("DigitalOcean Spaces deployment", () => {
     const extendedTarget = {
       ...plan,
       target: { ...plan.target, account: "unbound-account" },
-    } as SpacesDeploymentPlan;
+    } as unknown as SpacesDeploymentPlan;
 
     await expect(applyWithClient(noncanonicalTarget, send)).rejects.toThrow(
       "exact canonical values",
@@ -823,6 +823,7 @@ function matchingHead(
 
 function planOptions(directory: string) {
   return {
+    mode: "immutable",
     directory,
     endpoint: "https://fra1.digitaloceanspaces.com",
     region: "fra1",

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.0
+
+### Minor Changes
+
+- Add stable URL deployment with scoped DigitalOcean CDN invalidation as the default. Stable
+  schema-v3 plans keep object keys unchanged across releases, bind the cache policy and purge
+  scope to the plan ID, verify the CDN origin before uploading, retain previous object versions,
+  verify the uploaded and current versions, and fail with a partial receipt if the purge fails.
+  Repeated apply skips matching uploads and retries the purge. Include a copyable GitHub Actions
+  workflow and browser-revalidating cache headers.
+
+  Breaking change: creating a plan now defaults to stable mode and requires a dedicated prefix and
+  CDN endpoint ID; applying it additionally requires a DigitalOcean API token. Use `mode: "immutable"`
+  or `--mode immutable` to retain the old behavior. Existing schema-v2 plan files and plan IDs remain
+  valid. Exported plan and receipt types are now discriminated unions; narrow on `schemaVersion`
+  before accessing stable-only fields. No stored objects or CDN endpoints are deleted.
+
 All notable changes to Slice Media Spaces Deployer are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 

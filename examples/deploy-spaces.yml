@@ -1,0 +1,68 @@
+# Copy into the consuming project's .github/workflows/ directory.
+name: Deploy browser assets
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spaces-${{ vars.DO_SPACE_NAME }}-${{ vars.DO_DEPLOY_PREFIX }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: pnpm/setup@84cb39b217b10273981911c288cd62326dc7c6d2 # v2
+        with:
+          version: 11.21.0
+          runtime: node@24
+          cache: true
+          install: false
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Plan stable URLs and scoped CDN invalidation
+        shell: bash
+        env:
+          DO_SPACE_REGION: ${{ vars.DO_SPACE_REGION }}
+          DO_SPACE_NAME: ${{ vars.DO_SPACE_NAME }}
+          DO_DEPLOY_PREFIX: ${{ vars.DO_DEPLOY_PREFIX }}
+          DO_CDN_ENDPOINT_ID: ${{ vars.DO_CDN_ENDPOINT_ID }}
+        run: |
+          pnpm exec slicemedia-spaces plan \
+            --mode stable \
+            --directory dist \
+            --endpoint "https://${DO_SPACE_REGION}.digitaloceanspaces.com" \
+            --region "$DO_SPACE_REGION" \
+            --bucket "$DO_SPACE_NAME" \
+            --prefix "$DO_DEPLOY_PREFIX" \
+            --release-version "$GITHUB_SHA" \
+            --cdn-endpoint-id "$DO_CDN_ENDPOINT_ID" \
+            --plan .slicemedia/spaces-deployer/deployment.json
+      - name: Apply the planned deployment
+        shell: bash
+        env:
+          DIGITALOCEAN_SPACES_ACCESS_KEY_ID: ${{ secrets.DIGITALOCEAN_SPACES_ACCESS_KEY_ID }}
+          DIGITALOCEAN_SPACES_SECRET_ACCESS_KEY: ${{ secrets.DIGITALOCEAN_SPACES_SECRET_ACCESS_KEY }}
+          DIGITALOCEAN_SPACES_SESSION_TOKEN: ${{ secrets.DIGITALOCEAN_SPACES_SESSION_TOKEN }}
+          DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
+        run: |
+          if [ -z "$DIGITALOCEAN_SPACES_SESSION_TOKEN" ]; then
+            unset DIGITALOCEAN_SPACES_SESSION_TOKEN
+          fi
+          plan_id="$(node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            process.stdout.write(JSON.parse(readFileSync(process.argv[1], "utf8")).planId);
+          ' .slicemedia/spaces-deployer/deployment.json)"
+          pnpm exec slicemedia-spaces apply \
+            --plan .slicemedia/spaces-deployer/deployment.json \
+            --plan-id "$plan_id" \
+            --yes

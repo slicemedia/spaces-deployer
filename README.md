@@ -1,8 +1,12 @@
 # Slice Media Spaces Deployer
 
-Slice Media Spaces Deployer creates reviewed, content-addressed deployment plans and applies them to DigitalOcean Spaces without deleting or replacing existing object versions.
+Slice Media Spaces Deployer updates browser assets at stable DigitalOcean Spaces URLs and purges
+the project's CDN cache after verifying the upload. Webflow script tags can keep the same URLs
+across deployments. Bucket versioning retains previous object versions for rollback.
 
-The package exposes a TypeScript API and the `slicemedia-spaces` CLI. It deliberately has no default endpoint, region, bucket, prefix, release version, credentials, delete operation, or mutable `latest` alias.
+The package exposes a TypeScript API and the `slicemedia-spaces` CLI. All account and project
+settings are explicit. Stable deployment is the default; `mode: "immutable"` retains the original
+content-addressed release behavior. The package never deletes stored objects or CDN endpoints.
 
 ## Install
 
@@ -33,7 +37,10 @@ same-user locking policy.
 
 ## TypeScript API
 
-Planning reads the complete local artifact directory and produces a credential-free schema-v2 plan. Applying requires the exact plan ID and credentials supplied separately from the plan.
+Planning reads the complete local artifact directory and produces a credential-free plan. Stable
+plans use schema v3 and bind the destination keys, cache policy, CDN endpoint and purge scope to
+the plan ID. Immutable plans continue using schema v2. Applying requires the exact plan ID and
+credentials supplied separately from the plan.
 
 The API returns the plan in memory. If a direct API consumer persists it, the consumer must keep it
 in ignored local storage with owner-only permissions. Plans contain an absolute local source path
@@ -48,12 +55,14 @@ const plan = await createDeploymentPlan({
   endpoint: "https://fra1.digitaloceanspaces.com",
   region: "fra1",
   bucket: "my-assets",
-  prefix: "releases",
+  prefix: "project/assets",
   releaseVersion: "2026.08.21-1",
+  cdnEndpointId: "12345678-1234-1234-1234-123456789abc", // Replace with your endpoint ID.
 });
 
 await applyDeploymentPlan(plan, {
   confirmedPlanId: plan.planId,
+  cdnApiToken: process.env.DIGITALOCEAN_TOKEN!,
   credentials: {
     accessKeyId: process.env.DIGITALOCEAN_SPACES_ACCESS_KEY_ID!,
     secretAccessKey: process.env.DIGITALOCEAN_SPACES_SECRET_ACCESS_KEY!,
@@ -63,7 +72,10 @@ await applyDeploymentPlan(plan, {
 
 ## CLI
 
-The CLI keeps credentials out of arguments and plan files. It reads them only during `apply` from `DIGITALOCEAN_SPACES_ACCESS_KEY_ID`, `DIGITALOCEAN_SPACES_SECRET_ACCESS_KEY`, and the optional `DIGITALOCEAN_SPACES_SESSION_TOKEN`.
+The CLI keeps credentials out of arguments and plan files. It reads them only during `apply` from
+`DIGITALOCEAN_SPACES_ACCESS_KEY_ID`, `DIGITALOCEAN_SPACES_SECRET_ACCESS_KEY`, and the optional
+`DIGITALOCEAN_SPACES_SESSION_TOKEN`. Stable apply also requires `DIGITALOCEAN_TOKEN`, a separate
+DigitalOcean API token with access to read the CDN endpoint and purge its cache.
 
 ```sh
 slicemedia-spaces plan \
@@ -71,8 +83,9 @@ slicemedia-spaces plan \
   --endpoint https://fra1.digitaloceanspaces.com \
   --region fra1 \
   --bucket my-assets \
-  --prefix releases \
+  --prefix project/assets \
   --release-version 2026.08.21-1 \
+  --cdn-endpoint-id 12345678-1234-1234-1234-123456789abc \
   --plan .slicemedia/spaces-deployer/2026.08.21-1.json
 
 slicemedia-spaces apply \
@@ -82,6 +95,73 @@ slicemedia-spaces apply \
 ```
 
 `apply` refuses to run without both `--yes` and the exact plan ID. Unknown arguments are rejected, including attempts to pass credentials on the command line. Plans and receipts never contain credentials.
+
+For example, `dist/project.js` always uploads to `project/assets/project.js`. `releaseVersion` is
+an audit label, not part of a stable URL. `dist/project.css` follows the same rule.
+
+### Stable deployment and cache behavior
+
+1. Enable Spaces bucket versioning and configure public delivery independently. Supply a dedicated
+   deployment prefix with at least two segments, such as `project/assets`; do not share that prefix
+   with unrelated assets. Applying authorizes replacement of the exact keys listed in the plan,
+   including existing files written by other deployment tools.
+2. The deployer checks that the CDN endpoint's origin matches the planned bucket and region,
+   verifies versioning, and reads every destination before uploading. Missing credentials,
+   inaccessible destinations and existing objects without version IDs stop the deployment.
+3. Changed objects are uploaded at the same keys. Every upload is verified by its returned version
+   ID; a final check verifies that all planned versions are still current before invalidation.
+4. The deployer calls `DELETE /v2/cdn/endpoints/{id}/cache` with only `/<prefix>/*` and requires
+   HTTP 204. It never calls DELETE on the endpoint itself. A purge failure fails the deployment
+   and returns a partial receipt. Reapplying the same plan skips matching uploads and retries the
+   purge, including when every file already matches.
+
+Stable objects use `Cache-Control: public, max-age=0, s-maxage=300, must-revalidate`: browsers
+revalidate on their next request, while shared caches may retain a response for five minutes.
+CDN settings can affect edge caching; verify the public response headers in your environment.
+Purging the CDN does not refresh an already open page or erase copies cached under an older
+browser cache policy. See [DigitalOcean cache management](https://docs.digitalocean.com/products/spaces/how-to/manage-cdn-cache/)
+and [HTTP cache directives](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2).
+
+A stable receipt uses schema v3 and includes `cdn.status` (`not-requested`, `requested`, or
+`failed`). `requested` means the API accepted the purge, not that every edge was independently
+probed. Replaced files include their preflight `previousVersionId` for recovery. Prior versions
+and files removed from the local build are retained; this is not a destructive directory sync.
+
+Deployments with multiple files are not atomic. Serialize writers to the same prefix; the final
+read-back detects some races but cannot lock a bucket. A failed upload can leave a mix of versions
+at the origin even when no purge was requested. Restore a release by building its source again,
+planning with the same stable prefix, reviewing, and applying. Bucket history also retains prior
+bytes; restoring them through another tool must include cache invalidation.
+
+### Immutable releases and migration
+
+Use `--mode immutable` without `--cdn-endpoint-id` (or API `mode: "immutable"` without
+`cdnEndpointId`) for keys shaped as `<prefix>/<releaseVersion>/<artifactSetDigest>/<relativePath>`.
+This mode uses one-year immutable caching, rejects occupied mismatches, and makes no CDN requests.
+Existing schema-v2 plans and their IDs remain valid and always retain this behavior.
+
+New plans default to stable mode, so callers upgrading from 0.1 must either supply a CDN endpoint
+and dedicated prefix or explicitly select immutable mode. Stable deployments require the separate
+CDN API token during apply. Consumers of the TypeScript plan/receipt types must narrow on
+`schemaVersion` before accessing stable-only fields. Switching a Webflow project from release URLs
+requires updating its script tags to the stable URLs once; future deployments reuse those URLs.
+
+### GitHub Actions
+
+[examples/deploy-spaces.yml](examples/deploy-spaces.yml) is a copyable workflow for a pnpm project
+with this package installed. It builds, plans, and applies stable deployments, and serializes
+deployments to a prefix without cancelling an upload in progress. Place it in the consuming
+project's `.github/workflows/` directory and use its protected `production` environment to control
+deployment. The example is not an active deployment workflow in this package repository.
+
+Set repository variables `DO_SPACE_REGION`, `DO_SPACE_NAME`, `DO_DEPLOY_PREFIX`, and
+`DO_CDN_ENDPOINT_ID`. Configure environment secrets `DIGITALOCEAN_SPACES_ACCESS_KEY_ID`,
+`DIGITALOCEAN_SPACES_SECRET_ACCESS_KEY`, optional `DIGITALOCEAN_SPACES_SESSION_TOKEN`, and
+`DIGITALOCEAN_TOKEN`. The CDN token needs `cdn:read` and `cdn:delete` scopes, as documented by the
+[DigitalOcean CDN API](https://docs.digitalocean.com/reference/api/reference/cdn-endpoints/).
+DigitalOcean groups cache purging under delete permission; this package only deletes cache entries.
+Adapt dependency
+installation and build commands for npm or Yarn projects. Keep this package locked in the consumer.
 
 The CLI only reads or writes plan files beneath `.slicemedia/spaces-deployer/`. It creates an exact
 local `.gitignore` marker there and writes new plans with owner-only permissions on POSIX systems.
@@ -106,13 +186,21 @@ persistence is therefore not part of the package's security guarantee.
 
 ## Safety model
 
-- Plans use schema version 2 and are validated as exact plain-data structures before any remote request.
-- Every object key is namespaced as `<prefix>/<releaseVersion>/<artifactSetDigest>/<relativePath>`. The artifact-set digest is SHA-256 over canonical metadata for the complete file set; each file also carries SHA-384 integrity metadata.
+- Plans use schema version 3 for stable deployments and version 2 for immutable deployments. Both
+  are validated as exact plain-data structures before any remote request.
+- Stable keys are `<prefix>/<relativePath>`; immutable keys include the release version and
+  artifact-set digest. The digest is SHA-256 over canonical metadata for the complete file set;
+  each file also carries SHA-384 integrity metadata.
 - Applying re-reads and validates every local file before contacting DigitalOcean Spaces. Source drift fails before any remote request.
 - The target bucket must report versioning status `Enabled`. Otherwise applying fails before any `HeadObject` or `PutObject` request.
-- Applying completes `HeadObject` preflight for every planned key before the first upload. Only matching size, content type, cache policy, SHA-384 metadata, and artifact-set digest are skipped; occupied mismatches and ambiguous responses fail closed with no uploads started.
-- Every successful `PutObject` must return a version ID. Applying then performs `HeadObject` against that exact version and verifies its size, content type, immutable cache policy, SHA-384 metadata, and artifact-set digest before marking it uploaded.
-- Existing object versions are never deleted, and the package exposes no delete operation.
+- Applying completes `HeadObject` preflight for every planned key before the first upload. Only
+  matching size, content type, cache policy, SHA-384 metadata, and artifact-set digest are skipped.
+  Stable mode replaces mismatches while preserving prior versions; immutable mode rejects them.
+  Ambiguous responses fail closed with no uploads started.
+- Every successful `PutObject` must return a version ID. Applying then performs `HeadObject`
+  against that exact version and verifies its size, content type, planned cache policy, SHA-384
+  metadata, and artifact-set digest before marking it uploaded.
+- Existing object versions are never deleted. The only DELETE request is a scoped CDN cache purge.
 - Provider errors included in failure receipts are redacted against the supplied access key, secret key, and session token.
 - Fixed resource limits reject more than 1,000 files, 1,500 traversed entries, 1,000 directories
   (including the source root), 32 nested directory levels, any file larger than 64 MiB, or an
@@ -128,8 +216,12 @@ persistence is therefore not part of the package's security guarantee.
 - The package calls `GetBucketVersioning`, `HeadObject`, and `PutObject`. Configure a dedicated,
   narrowly scoped Spaces key that permits those operations. DigitalOcean may group object write
   permission with delete permission; this package still never issues a delete request.
-- Uploading does not configure bucket policies, object ACLs, CORS, CDN settings, custom domains, or
-  cache purges. New objects use the bucket's existing access behavior. Browser-hosted assets require
+- Stable mode additionally reads the selected DigitalOcean CDN endpoint and purges only the
+  reviewed project prefix after successful read-back. The API token stays outside the plan and
+  receipts; redirects are rejected and requests have a 30-second timeout.
+- Uploading does not configure bucket policies, object ACLs, CORS, CDN settings, or custom domains.
+  New object versions use the bucket's existing access behavior, not a previous version's
+  per-object ACL. Browser-hosted assets require
   an independently reviewed public-read or delivery configuration and a retrieval check after
   deployment.
 - A successful receipt proves that the planned version was uploaded or that matching provider
@@ -140,7 +232,11 @@ persistence is therefore not part of the package's security guarantee.
 
 DigitalOcean Spaces does not support the atomic conditional `PutObject` needed for a true create-only write, including `If-None-Match`. Slice Media Spaces Deployer therefore does not claim atomic no-overwrite behavior and does not send an unsupported condition.
 
-An external writer can create or change a key after the complete HEAD preflight and before this process sends its PUT. Mandatory bucket versioning preserves the prior version in that race, but it does not prevent the race or guarantee which version another reader observes as current. Digest-derived key namespaces prevent legitimate plans with different content from selecting the same key; they do not act as a distributed lock.
+An external writer can change a key after the complete HEAD preflight or final current-version
+check. Mandatory bucket versioning preserves prior versions but provides no lock or atomic
+multi-file release. In immutable mode, digest-derived namespaces keep different artifact sets
+apart. In stable mode, serialize all writers; a receipt's previous version ID describes the
+preflight observation and may not be the immediately preceding version if another writer raced.
 
 ## Support and maintenance
 
