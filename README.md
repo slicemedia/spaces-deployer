@@ -3,6 +3,8 @@
 Slice Media Spaces Deployer updates browser assets at stable DigitalOcean Spaces URLs and purges
 the project's CDN cache after verifying the upload. Webflow script tags can keep the same URLs
 across deployments. Optional bucket versioning retains previous object versions for rollback.
+Use `acl: "public-read"` (CLI `--acl public-read` during planning) to publish browser assets and
+verify their unsigned origin and CDN URLs.
 
 The package exposes a TypeScript API and the `slicemedia-spaces` CLI. All account and project
 settings are explicit. Stable deployment is the default; `mode: "immutable"` retains the original
@@ -39,8 +41,8 @@ same-user locking policy.
 
 Planning reads the complete local artifact directory and produces a credential-free plan. Stable
 plans use schema v3 and bind the destination keys, cache policy, CDN endpoint and purge scope to
-the plan ID. Immutable plans continue using schema v2. Applying requires the exact plan ID and
-credentials supplied separately from the plan.
+the plan ID. An optional `acl: "public-read"` is also bound to the plan ID. Immutable plans continue
+using schema v2. Applying requires the exact plan ID and credentials supplied separately from the plan.
 
 The API returns the plan in memory. If a direct API consumer persists it, the consumer must keep it
 in ignored local storage with owner-only permissions. Plans contain an absolute local source path
@@ -58,6 +60,7 @@ const plan = await createDeploymentPlan({
   prefix: "project/assets",
   releaseVersion: "2026.08.21-1",
   cdnEndpointId: "12345678-1234-1234-1234-123456789abc", // Replace with your endpoint ID.
+  acl: "public-read", // The planned browser assets will be publicly readable.
 });
 
 await applyDeploymentPlan(plan, {
@@ -79,6 +82,7 @@ DigitalOcean API token with access to read the CDN endpoint and purge its cache.
 
 ```sh
 slicemedia-spaces plan \
+  --acl public-read \
   --directory dist \
   --endpoint https://fra1.digitaloceanspaces.com \
   --region fra1 \
@@ -101,7 +105,8 @@ an audit label, not part of a stable URL. `dist/project.css` follows the same ru
 
 ### Stable deployment and cache behavior
 
-1. Configure public delivery independently. Bucket versioning is optional. Supply a dedicated
+1. Plan browser assets with `--acl public-read`, or configure public delivery independently.
+   Bucket versioning is optional. Supply a dedicated
    deployment prefix with at least two segments, such as `project/assets`; do not share that prefix
    with unrelated assets. Applying authorizes replacement of the exact keys listed in the plan,
    including existing files written by other deployment tools.
@@ -160,10 +165,43 @@ CDN API token during apply. Consumers of the TypeScript plan/receipt types must 
 `schemaVersion` before accessing stable-only fields. Switching a Webflow project from release URLs
 requires updating its script tags to the stable URLs once; future deployments reuse those URLs.
 
+### Public browser assets
+
+Starting in 0.2.2, set `acl: "public-read"` in `createDeploymentPlan`, or pass `--acl public-read`
+to `slicemedia-spaces plan`. Both stable and immutable deployments support it. This publishes every
+file listed in that plan. The ACL is part of the plan ID and cannot be added during apply. Existing
+plans without an ACL keep their existing behavior and IDs; create a new plan at a new plan-file
+path to opt in. This is an optional field within schemas v2 and v3 and requires deployer 0.2.2+.
+
+Uploads send `ACL: "public-read"`. Before skipping a matching file, the deployer checks its object
+ACL. Matching files that are still private are reuploaded with public-read, including files created
+by an earlier deployment. Public matching files are skipped, so retries do not upload them again.
+The Spaces key needs `GetObjectAcl` and permission to set an ACL during `PutObject`, in addition
+to its normal object read/write permissions. The package never changes the bucket policy or ACL.
+
+Every public file is downloaded without credentials from the standard Spaces origin URL and
+checked for HTTP 200, exact size, and SHA-384. Stable deployments then purge the configured prefix
+and perform the same check on the standard Spaces CDN URL. CDN checks try up to three times, one
+second apart, to allow cache propagation. Each request has a 30-second timeout, rejects redirects,
+and stops reading responses larger than the planned file. No signed query string, Authorization
+header, cookie, or cache-busting URL is used.
+
+Verified URLs are recorded in each file receipt's `publicUrls`; the receipt also records the planned
+`acl`. A public-check failure fails the deployment. Origin failures occur before purging; failures
+after an accepted purge retain `cdn.status: "requested"` in the failed receipt. Reapply to retry.
+Checks cover the responding origin/CDN location, not every edge or a custom CDN domain. Configure
+custom domains, bucket policies and CORS separately when the consuming site requires them.
+
+Without `acl`, uploads do not set object permissions or perform anonymous retrieval checks.
+DigitalOcean defaults new objects to private unless a separate policy grants access. Continue
+including public-read in subsequent plans for browser assets; omitting it does not preserve the
+previous object's ACL on a new upload. See [Spaces file permissions](https://docs.digitalocean.com/products/spaces/how-to/set-file-permissions/).
+
 ### GitHub Actions
 
 [examples/deploy-spaces.yml](examples/deploy-spaces.yml) is a copyable workflow for a pnpm project
-with this package installed. It builds, plans, and applies stable deployments, and serializes
+with this package installed at 0.2.2 or newer. It explicitly plans `--acl public-read`, builds and
+applies stable deployments, verifies public delivery, and serializes
 deployments to a prefix without cancelling an upload in progress. Place it in the consuming
 project's `.github/workflows/` directory and use its protected `production` environment to control
 deployment. The example is not an active deployment workflow in this package repository.
@@ -228,24 +266,24 @@ persistence is therefore not part of the package's security guarantee.
 
 ### Trust boundaries
 
-- Read-back verifies provider metadata and the uploaded version ID or ETag. It does not download
-  and rehash the remote body, and it does not treat object metadata as protection against a
-  malicious storage administrator.
-- The package calls `HeadObject` and `PutObject`, plus `GetBucketVersioning` only when explicitly
+- Authenticated read-back verifies provider metadata and the uploaded version ID or ETag. Only
+  public-read plans additionally download and hash the anonymous response. Neither check protects
+  against subsequent changes by a storage administrator.
+- The package calls `HeadObject` and `PutObject`, plus `GetObjectAcl` for public-read skip checks
+  and `GetBucketVersioning` only when explicitly
   required. Configure a dedicated, narrowly scoped Spaces key that permits those operations.
   DigitalOcean may group object write
   permission with delete permission; this package still never issues a delete request.
 - Stable mode additionally reads the selected DigitalOcean CDN endpoint and purges only the
   reviewed project prefix after successful read-back. The API token stays outside the plan and
   receipts; redirects are rejected and requests have a 30-second timeout.
-- Uploading does not configure bucket policies, object ACLs, CORS, CDN settings, or custom domains.
-  New object versions use the bucket's existing access behavior, not a previous version's
-  per-object ACL. Browser-hosted assets require
-  an independently reviewed public-read or delivery configuration and a retrieval check after
-  deployment.
+- Public-read plans explicitly set the uploaded objects' ACLs and verify unsigned delivery.
+  Other plans do not set an object ACL. Uploading never configures bucket policies, bucket ACLs,
+  CORS, CDN settings, or custom domains. New uploads do not inherit a previous version's per-object ACL.
 - A successful receipt proves that the planned object was uploaded or that matching provider
   metadata already existed at the planned key. It does not publish a Webflow site, update Webflow
-  custom code, or prove that a public CDN URL serves the new object.
+  custom code, or prove that all CDN edges serve the new object. Public-read receipts additionally
+  record the unsigned URLs whose bytes matched the plan during verification.
 
 ### Non-atomic HEAD-to-PUT interval
 

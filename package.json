@@ -1,6 +1,6 @@
 {
   "name": "@slicemedia/spaces-deployer",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": false,
   "description": "Stable-URL deployments with scoped CDN invalidation and version history for DigitalOcean Spaces.",
   "author": "Slice Media",

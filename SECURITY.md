@@ -54,7 +54,21 @@ Immutable schema-v2 plans retain their digest-derived namespaces and reject occu
 The default mode change does not reinterpret saved plans. Stable plans require adversarial tests
 for scope expansion, plan tampering, mismatched origins, partial writes and purge failures.
 
-The package does not manage public access, bucket policy, ACL, CORS, CDN configuration, domains, or
-Webflow publishing. Treat those as separate reviewed operations. Read-back validates provider metadata for
-the uploaded version or ETag; it is not a remote-body hash or a defense against a malicious storage
-administrator.
+Public access requires an explicit `acl: "public-read"` in the plan. The optional field is validated
+and included in the plan ID for both schemas; adding or removing it invalidates confirmation. Plans
+without it retain their existing IDs and never set an ACL or make anonymous retrieval requests.
+Public plans send the canned object ACL during upload and read matching objects' ACLs before
+skipping; private matches are reuploaded, never silently skipped. ACL preflight errors stop all writes.
+
+Public origin checks precede a CDN purge. After an accepted purge, public CDN checks verify the
+standard Spaces CDN URL. Public requests carry no credentials, reject redirects, use only derived
+HTTPS Spaces hosts and encoded object keys, enforce a 30-second timeout, and stream no more than
+the planned file size before checking SHA-384. Raw public transport errors and response bodies
+are never exposed. CDN verification has a bounded three-attempt retry. Failed checks return partial
+receipts that preserve whether a purge was already requested. Verification samples the responding
+edge only; it does not prove global propagation or custom-domain behavior.
+
+The package does not manage bucket policy, bucket ACL, CORS, CDN configuration, domains, or Webflow
+publishing. Treat those as separate reviewed operations. Authenticated read-back validates provider
+metadata for the uploaded version or ETag; only explicit public-read plans also hash the bytes
+retrieved anonymously. Neither check protects against subsequent changes by a storage administrator.

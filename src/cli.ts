@@ -126,6 +126,7 @@ async function dispatch(
       data: [
         "plan --directory <dir> --endpoint <url> --region <region> --bucket <bucket> --prefix <project/assets> --release-version <version> --cdn-endpoint-id <uuid> --plan .slicemedia/spaces-deployer/<file>.json",
         "Stable URLs and scoped CDN invalidation are the default. Use --mode immutable without --cdn-endpoint-id for content-addressed releases.",
+        "Add --acl public-read when planning browser assets to publish the listed files and verify their unsigned URLs.",
         "apply --plan .slicemedia/spaces-deployer/<file>.json --plan-id <id> --yes [--require-bucket-versioning]",
         "Bucket versioning is optional. --require-bucket-versioning enforces enabled versioning and durable version IDs.",
       ],
@@ -144,6 +145,7 @@ async function dispatch(
         "release-version",
         "mode",
         "cdn-endpoint-id",
+        "acl",
       ],
       flags: ["json"],
     });
@@ -167,6 +169,7 @@ async function dispatch(
       releaseVersion: requireOption(args, "release-version"),
       mode,
       ...(cdnEndpointId === undefined ? {} : { cdnEndpointId }),
+      ...(args.options.has("acl") ? { acl: requirePublicReadAcl(args) } : {}),
     };
     const plan = await context.createPlan(options);
     await writePlan(storage, plan);
@@ -180,7 +183,7 @@ async function dispatch(
     return {
       ok: true,
       command: "plan",
-      summary: `Planned ${plan.files.length} ${plan.schemaVersion === 3 ? "stable-URL object(s) and scoped CDN invalidation" : "content-addressed object(s)"} as ${plan.planId}.`,
+      summary: `Planned ${plan.files.length} ${plan.schemaVersion === 3 ? "stable-URL object(s) and scoped CDN invalidation" : "content-addressed object(s)"} as ${plan.planId}.${plan.acl === "public-read" ? " These files will be publicly readable." : ""}`,
       data: { plan },
     };
   }
@@ -210,12 +213,17 @@ async function dispatch(
     return {
       ok: true,
       command: "apply",
-      summary: `Uploaded ${uploaded} object(s); skipped ${skipped} matching object(s).${receipt.schemaVersion === 3 ? " CDN purge requested." : ""}`,
+      summary: `Uploaded ${uploaded} object(s); skipped ${skipped} matching object(s).${receipt.schemaVersion === 3 ? " CDN purge requested." : ""}${receipt.acl === "public-read" ? " Public URLs verified." : ""}`,
       data: receipt,
     };
   }
 
   throw new Error(`Unknown command ${JSON.stringify(command)}. Run slicemedia-spaces help.`);
+}
+
+function requirePublicReadAcl(args: ParsedArguments): "public-read" {
+  if (requireOption(args, "acl") !== "public-read") throw new Error("--acl must be public-read.");
+  return "public-read";
 }
 
 function parseArguments(argv: readonly string[]): ParsedArguments {

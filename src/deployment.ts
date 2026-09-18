@@ -5,6 +5,7 @@ import path from "node:path";
 
 import {
   GetBucketVersioningCommand,
+  GetObjectAclCommand,
   HeadObjectCommand,
   PutObjectCommand,
   S3Client,
@@ -17,6 +18,7 @@ import {
   validateCdnToken,
   verifyCdnEndpoint,
 } from "./cdn.js";
+import { validateObjectAcl, verifyPublicObject } from "./public-access.js";
 import {
   SpacesDeploymentError,
   type ApplyDeploymentPlanOptions,
@@ -65,6 +67,7 @@ export async function createDeploymentPlan(
   const target = normalizeTarget(options);
   const releaseVersion = validateReleaseVersion(options.releaseVersion);
   const mode = options.mode ?? "stable";
+  const acl = validateObjectAcl(options.acl);
   if (mode !== "stable" && mode !== "immutable") {
     throw new Error("Deployment mode must be stable or immutable.");
   }
@@ -125,6 +128,7 @@ export async function createDeploymentPlan(
   }));
   const unsignedPlan = {
     ...delivery,
+    ...(acl === undefined ? {} : { acl }),
     sourceDirectory,
     target,
     releaseVersion,
@@ -223,6 +227,7 @@ export async function applyDeploymentPlan(
           ContentLength: file.size,
           ContentType: file.contentType,
           CacheControl: cacheControl(validatedPlan),
+          ...(validatedPlan.acl === undefined ? {} : { ACL: validatedPlan.acl }),
           Metadata: {
             sha384: file.sha384,
             "artifact-set-digest": validatedPlan.artifactSetDigest,
@@ -296,8 +301,19 @@ export async function applyDeploymentPlan(
     });
   }
 
-  if (validatedPlan.schemaVersion === 3 && cdnToken !== undefined) {
+  if (validatedPlan.acl === "public-read") {
+    await verifyPublicFiles(
+      validatedPlan,
+      timestamp,
+      receipts,
+      options.publicFetch ?? fetch,
+      false,
+    );
+  }
+  if (validatedPlan.schemaVersion === 3 || validatedPlan.acl === "public-read") {
     await verifyCurrentFiles(client, validatedPlan, timestamp, credentials, receipts);
+  }
+  if (validatedPlan.schemaVersion === 3 && cdnToken !== undefined) {
     try {
       // Retry invalidation even when a prior attempt uploaded every file already.
       await requestCdnPurge(validatedPlan, cdnToken, options.cdnFetch ?? fetch);
@@ -309,10 +325,21 @@ export async function applyDeploymentPlan(
         error: errorMessage,
       });
     }
-    return deploymentReceipt(validatedPlan, timestamp, "applied", receipts, {
+    const cdn: SpacesCdnPurgeReceipt = {
       ...validatedPlan.cdn,
       status: "requested",
-    });
+    };
+    if (validatedPlan.acl === "public-read") {
+      await verifyPublicFiles(
+        validatedPlan,
+        timestamp,
+        receipts,
+        options.publicFetch ?? fetch,
+        true,
+        cdn,
+      );
+    }
+    return deploymentReceipt(validatedPlan, timestamp, "applied", receipts, cdn);
   }
   return deploymentReceipt(validatedPlan, timestamp, "applied", receipts);
 }
@@ -455,6 +482,44 @@ async function preflightRemoteFiles(
           [{ key: file.key, status: "failed", error: "existing-object-missing-identity" }],
         );
       }
+      if (plan.acl === "public-read") {
+        const acl = await client
+          .send(
+            new GetObjectAclCommand({
+              Bucket: plan.target.bucket,
+              Key: file.key,
+              ...(versionId === undefined ? {} : { VersionId: versionId }),
+            }),
+          )
+          .catch((error: unknown) => {
+            // An ACL lookup failure, including 404, is not evidence that the key is available.
+            failDeployment(
+              plan,
+              timestamp,
+              `Cannot determine the existing object ACL: ${redactError(
+                error,
+                credentials,
+                deploymentSensitiveValues(plan, file),
+              )}`,
+              [{ key: file.key, status: "failed", error: "remote-preflight-ambiguous" }],
+            );
+          });
+        if (!Array.isArray(acl.Grants))
+          throw new Error("Cannot determine the existing object ACL.");
+        const publicRead = acl.Grants.some(
+          (grant) =>
+            grant.Permission === "READ" &&
+            grant.Grantee?.Type === "Group" &&
+            grant.Grantee.URI === "http://acs.amazonaws.com/groups/global/AllUsers",
+        );
+        if (!publicRead) {
+          decisions.push({
+            action: "upload",
+            ...(versionId === undefined ? {} : { previousVersionId: versionId }),
+          });
+          continue;
+        }
+      }
       decisions.push({
         action: "skip",
         ...(etag === undefined ? {} : { etag }),
@@ -525,7 +590,7 @@ function objectIdentityMatches(
 
 async function verifyCurrentFiles(
   client: S3Client,
-  plan: SpacesStableDeploymentPlan,
+  plan: SpacesDeploymentPlan,
   timestamp: string,
   credentials: SpacesCredentials,
   receipts: readonly SpacesDeploymentFileReceipt[],
@@ -551,10 +616,38 @@ async function verifyCurrentFiles(
       failDeployment(
         plan,
         timestamp,
-        "The current stable object could not be verified before CDN invalidation.",
+        "The current object could not be verified before completing the deployment.",
         receipts.map((receipt, receiptIndex) =>
           receiptIndex === index ? { ...receipt, status: "failed", error: errorMessage } : receipt,
         ),
+      );
+    }
+  }
+}
+
+async function verifyPublicFiles(
+  plan: SpacesDeploymentPlan,
+  timestamp: string,
+  receipts: SpacesDeploymentFileReceipt[],
+  request: typeof fetch,
+  cdn: boolean,
+  purge?: SpacesCdnPurgeReceipt,
+): Promise<void> {
+  for (const [index, file] of plan.files.entries()) {
+    try {
+      const url = await verifyPublicObject(plan, file, cdn, request);
+      const receipt = receipts[index]!;
+      receipts[index] = { ...receipt, publicUrls: [...(receipt.publicUrls ?? []), url] };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Public verification failed.";
+      failDeployment(
+        plan,
+        timestamp,
+        message,
+        receipts.map((receipt, receiptIndex) =>
+          receiptIndex === index ? { ...receipt, status: "failed", error: message } : receipt,
+        ),
+        purge,
       );
     }
   }
@@ -583,6 +676,7 @@ function deploymentReceipt(
     artifactSetDigest: plan.artifactSetDigest,
     timestamp,
     files: [...files],
+    ...(plan.acl === undefined ? {} : { acl: plan.acl }),
   };
 }
 
@@ -620,6 +714,7 @@ function validatePlan(input: SpacesDeploymentPlan): SpacesDeploymentPlan {
     typeof input === "object" &&
     input !== null &&
     Object.getOwnPropertyDescriptor(input, "schemaVersion")?.value === 3;
+  const hasAcl = typeof input === "object" && input !== null && Object.hasOwn(input, "acl");
   const plan = exactRecord(
     input,
     [
@@ -631,12 +726,14 @@ function validatePlan(input: SpacesDeploymentPlan): SpacesDeploymentPlan {
       "sourceDirectory",
       "target",
       ...(stable ? ["mode", "cacheControl", "cdn"] : []),
+      ...(hasAcl ? ["acl"] : []),
     ],
     "deployment plan",
   );
   if (plan.schemaVersion !== 2 && plan.schemaVersion !== 3) {
     throw new Error("Unsupported Spaces deployment plan schema.");
   }
+  const acl = hasAcl ? validateObjectAcl(stringField(plan, "acl", "deployment plan")) : undefined;
 
   const planId = stringField(plan, "planId", "deployment plan");
   const sourceDirectory = stringField(plan, "sourceDirectory", "deployment plan");
@@ -730,6 +827,7 @@ function validatePlan(input: SpacesDeploymentPlan): SpacesDeploymentPlan {
   }
   const expected = calculatePlanId({
     ...delivery,
+    ...(acl === undefined ? {} : { acl }),
     sourceDirectory,
     target,
     releaseVersion,
@@ -739,6 +837,7 @@ function validatePlan(input: SpacesDeploymentPlan): SpacesDeploymentPlan {
   if (planId !== expected) throw new Error("Deployment plan ID does not match its contents.");
   return {
     ...delivery,
+    ...(acl === undefined ? {} : { acl }),
     planId,
     sourceDirectory,
     target,
@@ -799,6 +898,7 @@ function calculatePlanId(plan: UnsignedPlan): string {
     ...(plan.schemaVersion === 3
       ? { mode: plan.mode, cacheControl: plan.cacheControl, cdn: plan.cdn }
       : {}),
+    ...(plan.acl === undefined ? {} : { acl: plan.acl }),
   });
   return `spaces-${createHash("sha256").update(canonical).digest("hex")}`;
 }

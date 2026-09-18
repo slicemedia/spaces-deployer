@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2
+
+### Patch Changes
+
+- Add an explicit `acl: "public-read"` planning option and CLI `--acl public-read` for browser assets.
+  The setting is bound to the plan ID, repairs matching private objects through reupload, and verifies
+  unsigned origin and standard CDN URLs against the planned bytes. Public-check failures return failed
+  receipts, including accepted purge status and any verified URLs. Existing plans keep their behavior;
+  bucket versioning remains optional. Update the browser-assets workflow example to opt in.
+
 ## 0.2.1
 
 ### Patch Changes
