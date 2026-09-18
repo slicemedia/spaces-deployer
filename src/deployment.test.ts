@@ -129,7 +129,7 @@ describe("DigitalOcean Spaces deployment", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  it("verifies versioning and every key before uploading without unsupported conditions", async () => {
+  it("verifies required versioning and every key before uploading without unsupported conditions", async () => {
     const plan = await fixturePlan();
     const byKey = new Map(plan.files.map((file) => [file.key, file]));
     const send = vi.fn(async (command: unknown) => {
@@ -152,6 +152,7 @@ describe("DigitalOcean Spaces deployment", () => {
     const receipt = await applyDeploymentPlan(plan, {
       confirmedPlanId: plan.planId,
       credentials,
+      requireBucketVersioning: true,
       client: { send } as unknown as S3Client,
       now: () => new Date("2026-08-12T12:00:00.000Z"),
     });
@@ -348,7 +349,7 @@ describe("DigitalOcean Spaces deployment", () => {
     },
   );
 
-  it("redacts provider errors while checking mandatory bucket versioning", async () => {
+  it("redacts provider errors while checking explicitly required bucket versioning", async () => {
     const plan = await fixturePlan();
     const send = vi
       .fn()
@@ -776,6 +777,7 @@ async function applyWithClient(plan: SpacesDeploymentPlan, send: ReturnType<type
   return applyDeploymentPlan(plan, {
     confirmedPlanId: plan.planId,
     credentials,
+    requireBucketVersioning: true,
     client: { send } as unknown as S3Client,
     now: () => new Date("2026-08-12T12:00:00.000Z"),
   });

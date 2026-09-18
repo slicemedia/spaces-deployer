@@ -204,41 +204,56 @@ describe("slicemedia-spaces", () => {
     expect(createPlan).not.toHaveBeenCalled();
   });
 
-  it("requires --yes and the exact plan ID before invoking apply", async () => {
-    const cwd = await mkdtemp(path.join(tmpdir(), "slicemedia-spaces-cli-test-"));
-    temporaryDirectories.push(cwd);
-    const plan = samplePlan(cwd);
-    const createPlan = vi.fn().mockResolvedValue(plan);
-    await runSpacesCli(planArguments(), { cwd, writer: collectingWriter([]), createPlan });
-    const applyPlan = vi.fn().mockResolvedValue(sampleReceipt(plan));
+  it.each([false, true])(
+    "requires --yes and the exact plan ID with strict versioning %s",
+    async (requireBucketVersioning) => {
+      const cwd = await mkdtemp(path.join(tmpdir(), "slicemedia-spaces-cli-test-"));
+      temporaryDirectories.push(cwd);
+      const plan = samplePlan(cwd);
+      const createPlan = vi.fn().mockResolvedValue(plan);
+      await runSpacesCli(planArguments(), { cwd, writer: collectingWriter([]), createPlan });
+      const applyPlan = vi.fn().mockResolvedValue(sampleReceipt(plan));
 
-    const errors: string[] = [];
-    expect(
-      await runSpacesCli(["apply", "--plan", privatePlanPath, "--plan-id", plan.planId], {
-        cwd,
-        writer: collectingWriter([], errors),
-        applyPlan,
-      }),
-    ).toBe(1);
-    expect(errors.join("\n")).toContain("--yes");
-    expect(applyPlan).not.toHaveBeenCalled();
+      const errors: string[] = [];
+      expect(
+        await runSpacesCli(["apply", "--plan", privatePlanPath, "--plan-id", plan.planId], {
+          cwd,
+          writer: collectingWriter([], errors),
+          applyPlan,
+        }),
+      ).toBe(1);
+      expect(errors.join("\n")).toContain("--yes");
+      expect(applyPlan).not.toHaveBeenCalled();
 
-    expect(
-      await runSpacesCli(["apply", "--plan", privatePlanPath, "--plan-id", plan.planId, "--yes"], {
-        cwd,
-        env: {
-          DIGITALOCEAN_SPACES_ACCESS_KEY_ID: "access",
-          DIGITALOCEAN_SPACES_SECRET_ACCESS_KEY: "secret",
-        },
-        writer: collectingWriter([]),
-        applyPlan,
-      }),
-    ).toBe(0);
-    expect(applyPlan).toHaveBeenCalledWith(plan, {
-      confirmedPlanId: plan.planId,
-      credentials: { accessKeyId: "access", secretAccessKey: "secret" },
-    });
-  });
+      expect(
+        await runSpacesCli(
+          [
+            "apply",
+            "--plan",
+            privatePlanPath,
+            "--plan-id",
+            plan.planId,
+            "--yes",
+            ...(requireBucketVersioning ? ["--require-bucket-versioning"] : []),
+          ],
+          {
+            cwd,
+            env: {
+              DIGITALOCEAN_SPACES_ACCESS_KEY_ID: "access",
+              DIGITALOCEAN_SPACES_SECRET_ACCESS_KEY: "secret",
+            },
+            writer: collectingWriter([]),
+            applyPlan,
+          },
+        ),
+      ).toBe(0);
+      expect(applyPlan).toHaveBeenCalledWith(plan, {
+        confirmedPlanId: plan.planId,
+        credentials: { accessKeyId: "access", secretAccessKey: "secret" },
+        ...(requireBucketVersioning ? { requireBucketVersioning: true } : {}),
+      });
+    },
+  );
 
   it("returns a machine-readable partial failure receipt only when JSON is requested", async () => {
     const cwd = await mkdtemp(path.join(tmpdir(), "slicemedia-spaces-cli-test-"));

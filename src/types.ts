@@ -75,6 +75,8 @@ export interface CreateDeploymentPlanOptions {
 export interface ApplyDeploymentPlanOptions {
   readonly confirmedPlanId: string;
   readonly credentials: SpacesCredentials;
+  /** Opt in to requiring enabled bucket versioning and durable object version IDs. */
+  readonly requireBucketVersioning?: boolean;
   readonly cdnApiToken?: string;
   readonly cdnFetch?: typeof fetch;
   readonly client?: S3Client;
