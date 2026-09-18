@@ -31,6 +31,8 @@ interface DeploymentPlanContents {
   readonly releaseVersion: string;
   readonly artifactSetDigest: string;
   readonly files: readonly SpacesDeploymentFile[];
+  /** Explicit public-read access, bound to the plan ID. Omitted plans do not set an ACL. */
+  readonly acl?: "public-read";
 }
 
 /** Existing schema-v2 plans retain their immutable keys and plan IDs. */
@@ -70,6 +72,8 @@ export interface CreateDeploymentPlanOptions {
   readonly mode?: SpacesDeploymentMode;
   /** Required for stable deployments; credentials are supplied only when applying. */
   readonly cdnEndpointId?: string;
+  /** Publish the planned files for anonymous access and verify their public URLs. */
+  readonly acl?: "public-read";
 }
 
 export interface ApplyDeploymentPlanOptions {
@@ -79,6 +83,7 @@ export interface ApplyDeploymentPlanOptions {
   readonly requireBucketVersioning?: boolean;
   readonly cdnApiToken?: string;
   readonly cdnFetch?: typeof fetch;
+  readonly publicFetch?: typeof fetch;
   readonly client?: S3Client;
   readonly now?: () => Date;
 }
@@ -90,6 +95,8 @@ export interface SpacesDeploymentFileReceipt {
   readonly versionId?: string;
   readonly previousVersionId?: string;
   readonly error?: string;
+  /** Unsigned URLs successfully retrieved and checked against the planned bytes. */
+  readonly publicUrls?: readonly string[];
 }
 
 interface DeploymentReceiptContents {
@@ -101,6 +108,7 @@ interface DeploymentReceiptContents {
   readonly artifactSetDigest: string;
   readonly timestamp: string;
   readonly files: readonly SpacesDeploymentFileReceipt[];
+  readonly acl?: "public-read";
 }
 
 export interface SpacesCdnPurgeReceipt extends SpacesCdnPurge {

@@ -29,7 +29,7 @@ jobs:
           install: false
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
-      - name: Plan stable URLs and scoped CDN invalidation
+      - name: Plan public browser assets and scoped CDN invalidation
         shell: bash
         env:
           DO_SPACE_REGION: ${{ vars.DO_SPACE_REGION }}
@@ -39,6 +39,7 @@ jobs:
         run: |
           pnpm exec slicemedia-spaces plan \
             --mode stable \
+            --acl public-read \
             --directory dist \
             --endpoint "https://${DO_SPACE_REGION}.digitaloceanspaces.com" \
             --region "$DO_SPACE_REGION" \

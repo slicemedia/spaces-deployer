@@ -204,6 +204,78 @@ describe("slicemedia-spaces", () => {
     expect(createPlan).not.toHaveBeenCalled();
   });
 
+  it("records public-read during planning and reports verified public delivery during apply", async () => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "slicemedia-public-cli-"));
+    temporaryDirectories.push(cwd);
+    const plan = { ...samplePlan(cwd), acl: "public-read" as const };
+    const createPlan = vi.fn().mockResolvedValue(plan);
+    const output: string[] = [];
+    expect(
+      await runSpacesCli([...planArguments(), "--acl", "public-read"], {
+        cwd,
+        createPlan,
+        writer: collectingWriter(output),
+      }),
+    ).toBe(0);
+    expect(createPlan).toHaveBeenCalledWith(expect.objectContaining({ acl: "public-read" }));
+    expect(JSON.parse(await readFile(path.join(cwd, privatePlanPath), "utf8"))).toHaveProperty(
+      "acl",
+      "public-read",
+    );
+    expect(output.join("\n")).toContain("publicly readable");
+    const applyPlan = vi.fn().mockResolvedValue({ ...sampleReceipt(plan), acl: "public-read" });
+    const env = {
+      DIGITALOCEAN_SPACES_ACCESS_KEY_ID: "access",
+      DIGITALOCEAN_SPACES_SECRET_ACCESS_KEY: "secret",
+    };
+    expect(
+      await runSpacesCli(["apply", "--plan", privatePlanPath, "--plan-id", plan.planId, "--yes"], {
+        cwd,
+        env,
+        applyPlan,
+        writer: collectingWriter(output),
+      }),
+    ).toBe(0);
+    expect(applyPlan).toHaveBeenCalledWith(
+      plan,
+      expect.objectContaining({ confirmedPlanId: plan.planId }),
+    );
+    expect(output.join("\n")).toContain("Public URLs verified");
+    applyPlan.mockClear();
+    expect(
+      await runSpacesCli(
+        [
+          "apply",
+          "--plan",
+          privatePlanPath,
+          "--plan-id",
+          plan.planId,
+          "--yes",
+          "--acl",
+          "public-read",
+        ],
+        { cwd, env, applyPlan, writer: collectingWriter([]) },
+      ),
+    ).toBe(1);
+    expect(applyPlan).not.toHaveBeenCalled();
+  });
+
+  it.each(["private", "public-read-write"])("rejects CLI ACL %s before planning", async (acl) => {
+    const cwd = await mkdtemp(path.join(tmpdir(), "slicemedia-public-cli-"));
+    temporaryDirectories.push(cwd);
+    const createPlan = vi.fn();
+    const errors: string[] = [];
+    expect(
+      await runSpacesCli([...planArguments(), "--acl", acl], {
+        cwd,
+        createPlan,
+        writer: collectingWriter([], errors),
+      }),
+    ).toBe(1);
+    expect(errors.join("\n")).toContain("--acl must be public-read");
+    expect(createPlan).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])(
     "requires --yes and the exact plan ID with strict versioning %s",
     async (requireBucketVersioning) => {
