@@ -126,7 +126,8 @@ async function dispatch(
       data: [
         "plan --directory <dir> --endpoint <url> --region <region> --bucket <bucket> --prefix <project/assets> --release-version <version> --cdn-endpoint-id <uuid> --plan .slicemedia/spaces-deployer/<file>.json",
         "Stable URLs and scoped CDN invalidation are the default. Use --mode immutable without --cdn-endpoint-id for content-addressed releases.",
-        "apply --plan .slicemedia/spaces-deployer/<file>.json --plan-id <id> --yes",
+        "apply --plan .slicemedia/spaces-deployer/<file>.json --plan-id <id> --yes [--require-bucket-versioning]",
+        "Bucket versioning is optional. --require-bucket-versioning enforces enabled versioning and durable version IDs.",
       ],
     };
   }
@@ -187,7 +188,7 @@ async function dispatch(
   if (command === "apply") {
     assertCommandShape(args, {
       options: ["plan", "plan-id"],
-      flags: ["json", "yes"],
+      flags: ["json", "yes", "require-bucket-versioning"],
     });
     if (!args.flags.has("yes")) throw new Error("Apply requires explicit --yes confirmation.");
     const confirmedPlanId = requireOption(args, "plan-id");
@@ -198,6 +199,7 @@ async function dispatch(
     const applyOptions: ApplyDeploymentPlanOptions = {
       confirmedPlanId,
       credentials,
+      ...(args.flags.has("require-bucket-versioning") ? { requireBucketVersioning: true } : {}),
       ...(plan.schemaVersion === 3 && context.env.DIGITALOCEAN_TOKEN !== undefined
         ? { cdnApiToken: context.env.DIGITALOCEAN_TOKEN }
         : {}),
@@ -208,7 +210,7 @@ async function dispatch(
     return {
       ok: true,
       command: "apply",
-      summary: `Uploaded ${uploaded} versioned object(s); skipped ${skipped} matching object(s).${receipt.schemaVersion === 3 ? " CDN purge requested." : ""}`,
+      summary: `Uploaded ${uploaded} object(s); skipped ${skipped} matching object(s).${receipt.schemaVersion === 3 ? " CDN purge requested." : ""}`,
       data: receipt,
     };
   }
@@ -220,7 +222,7 @@ function parseArguments(argv: readonly string[]): ParsedArguments {
   const positionals: string[] = [];
   const options = new Map<string, string>();
   const flags = new Set<string>();
-  const booleanOptions = new Set(["help", "json", "yes"]);
+  const booleanOptions = new Set(["help", "json", "yes", "require-bucket-versioning"]);
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === undefined) continue;

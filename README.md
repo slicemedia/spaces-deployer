@@ -2,7 +2,7 @@
 
 Slice Media Spaces Deployer updates browser assets at stable DigitalOcean Spaces URLs and purges
 the project's CDN cache after verifying the upload. Webflow script tags can keep the same URLs
-across deployments. Bucket versioning retains previous object versions for rollback.
+across deployments. Optional bucket versioning retains previous object versions for rollback.
 
 The package exposes a TypeScript API and the `slicemedia-spaces` CLI. All account and project
 settings are explicit. Stable deployment is the default; `mode: "immutable"` retains the original
@@ -101,19 +101,25 @@ an audit label, not part of a stable URL. `dist/project.css` follows the same ru
 
 ### Stable deployment and cache behavior
 
-1. Enable Spaces bucket versioning and configure public delivery independently. Supply a dedicated
+1. Configure public delivery independently. Bucket versioning is optional. Supply a dedicated
    deployment prefix with at least two segments, such as `project/assets`; do not share that prefix
    with unrelated assets. Applying authorizes replacement of the exact keys listed in the plan,
    including existing files written by other deployment tools.
 2. The deployer checks that the CDN endpoint's origin matches the planned bucket and region,
-   verifies versioning, and reads every destination before uploading. Missing credentials,
-   inaccessible destinations and existing objects without version IDs stop the deployment.
-3. Changed objects are uploaded at the same keys. Every upload is verified by its returned version
-   ID; a final check verifies that all planned versions are still current before invalidation.
+   and reads every destination before uploading. Missing credentials or inaccessible destinations
+   stop the deployment. No bucket-versioning lookup or permission is needed by default.
+3. Changed objects are uploaded at the same keys. Every upload is verified against its returned
+   version ID when available, or its ETag otherwise, plus the planned file metadata. A final check
+   verifies every current object before invalidation.
 4. The deployer calls `DELETE /v2/cdn/endpoints/{id}/cache` with only `/<prefix>/*` and requires
    HTTP 204. It never calls DELETE on the endpoint itself. A purge failure fails the deployment
    and returns a partial receipt. Reapplying the same plan skips matching uploads and retries the
    purge, including when every file already matches.
+
+Disabled or suspended versioning works without additional options. To require enabled bucket
+versioning and durable version IDs, pass `--require-bucket-versioning` to `apply`, or set
+`requireBucketVersioning: true` in the API's apply options. This opt-in check requires permission
+to call `GetBucketVersioning`. The package never changes the bucket's versioning setting.
 
 Stable objects use `Cache-Control: public, max-age=0, s-maxage=300, must-revalidate`: browsers
 revalidate on their next request, while shared caches may retain a response for five minutes.
@@ -124,14 +130,17 @@ and [HTTP cache directives](https://www.rfc-editor.org/rfc/rfc9111.html#section-
 
 A stable receipt uses schema v3 and includes `cdn.status` (`not-requested`, `requested`, or
 `failed`). `requested` means the API accepted the purge, not that every edge was independently
-probed. Replaced files include their preflight `previousVersionId` for recovery. Prior versions
-and files removed from the local build are retained; this is not a destructive directory sync.
+probed. Receipts include `versionId` and replacement `previousVersionId` only when durable version
+IDs are available. The S3 `null` version is mutable and is not reported as a recoverable version.
+Unversioned files use `etag` for verification. The package never deletes object versions or files
+removed from the local build; it is not a directory sync. Without enabled versioning, overwriting
+a file does not retain the old contents.
 
 Deployments with multiple files are not atomic. Serialize writers to the same prefix; the final
 read-back detects some races but cannot lock a bucket. A failed upload can leave a mix of versions
 at the origin even when no purge was requested. Restore a release by building its source again,
-planning with the same stable prefix, reviewing, and applying. Bucket history also retains prior
-bytes; restoring them through another tool must include cache invalidation.
+planning with the same stable prefix, reviewing, and applying. When versioning is enabled, bucket
+history also retains prior bytes; restoring them through another tool must include cache invalidation.
 
 ### Immutable releases and migration
 
@@ -139,6 +148,11 @@ Use `--mode immutable` without `--cdn-endpoint-id` (or API `mode: "immutable"` w
 `cdnEndpointId`) for keys shaped as `<prefix>/<releaseVersion>/<artifactSetDigest>/<relativePath>`.
 This mode uses one-year immutable caching, rejects occupied mismatches, and makes no CDN requests.
 Existing schema-v2 plans and their IDs remain valid and always retain this behavior.
+
+Starting in 0.2.1, bucket versioning is optional for both deployment modes, including saved plans.
+Existing workflows need only upgrade the package; their URLs, plans, and CDN settings stay valid.
+Projects that require version history should opt in with `--require-bucket-versioning` or
+`requireBucketVersioning: true`.
 
 New plans default to stable mode, so callers upgrading from 0.1 must either supply a CDN endpoint
 and dedicated prefix or explicitly select immutable mode. Stable deployments require the separate
@@ -192,14 +206,18 @@ persistence is therefore not part of the package's security guarantee.
   artifact-set digest. The digest is SHA-256 over canonical metadata for the complete file set;
   each file also carries SHA-384 integrity metadata.
 - Applying re-reads and validates every local file before contacting DigitalOcean Spaces. Source drift fails before any remote request.
-- The target bucket must report versioning status `Enabled`. Otherwise applying fails before any `HeadObject` or `PutObject` request.
+- Versioning is optional. If `requireBucketVersioning` is enabled, the target bucket must report
+  status `Enabled` before any `HeadObject` or `PutObject` request, and object version IDs are required.
 - Applying completes `HeadObject` preflight for every planned key before the first upload. Only
   matching size, content type, cache policy, SHA-384 metadata, and artifact-set digest are skipped.
-  Stable mode replaces mismatches while preserving prior versions; immutable mode rejects them.
+  Stable mode replaces mismatches; enabled bucket versioning preserves prior versions. Immutable
+  mode rejects mismatches. Skipped objects must provide a durable version ID or a nonempty ETag.
   Ambiguous responses fail closed with no uploads started.
-- Every successful `PutObject` must return a version ID. Applying then performs `HeadObject`
-  against that exact version and verifies its size, content type, planned cache policy, SHA-384
-  metadata, and artifact-set digest before marking it uploaded.
+- Every successful `PutObject` must return a durable version ID or a nonempty ETag. Applying then
+  performs `HeadObject` against that exact version when available, or the current object otherwise.
+  It verifies the version ID or ETag, size, content type, planned cache policy, SHA-384 metadata,
+  and artifact-set digest before marking it uploaded. Stable deployments repeat these checks on
+  every current object before requesting a purge.
 - Existing object versions are never deleted. The only DELETE request is a scoped CDN cache purge.
 - Provider errors included in failure receipts are redacted against the supplied access key, secret key, and session token.
 - Fixed resource limits reject more than 1,000 files, 1,500 traversed entries, 1,000 directories
@@ -210,11 +228,12 @@ persistence is therefore not part of the package's security guarantee.
 
 ### Trust boundaries
 
-- Read-back verifies what the provider reports for the exact uploaded version. It does not download
+- Read-back verifies provider metadata and the uploaded version ID or ETag. It does not download
   and rehash the remote body, and it does not treat object metadata as protection against a
   malicious storage administrator.
-- The package calls `GetBucketVersioning`, `HeadObject`, and `PutObject`. Configure a dedicated,
-  narrowly scoped Spaces key that permits those operations. DigitalOcean may group object write
+- The package calls `HeadObject` and `PutObject`, plus `GetBucketVersioning` only when explicitly
+  required. Configure a dedicated, narrowly scoped Spaces key that permits those operations.
+  DigitalOcean may group object write
   permission with delete permission; this package still never issues a delete request.
 - Stable mode additionally reads the selected DigitalOcean CDN endpoint and purges only the
   reviewed project prefix after successful read-back. The API token stays outside the plan and
@@ -224,7 +243,7 @@ persistence is therefore not part of the package's security guarantee.
   per-object ACL. Browser-hosted assets require
   an independently reviewed public-read or delivery configuration and a retrieval check after
   deployment.
-- A successful receipt proves that the planned version was uploaded or that matching provider
+- A successful receipt proves that the planned object was uploaded or that matching provider
   metadata already existed at the planned key. It does not publish a Webflow site, update Webflow
   custom code, or prove that a public CDN URL serves the new object.
 
@@ -233,8 +252,9 @@ persistence is therefore not part of the package's security guarantee.
 DigitalOcean Spaces does not support the atomic conditional `PutObject` needed for a true create-only write, including `If-None-Match`. Slice Media Spaces Deployer therefore does not claim atomic no-overwrite behavior and does not send an unsupported condition.
 
 An external writer can change a key after the complete HEAD preflight or final current-version
-check. Mandatory bucket versioning preserves prior versions but provides no lock or atomic
-multi-file release. In immutable mode, digest-derived namespaces keep different artifact sets
+check. Optional bucket versioning preserves prior versions but provides no lock or atomic
+multi-file release. Without versioning, recovery requires redeploying an earlier build. In
+immutable mode, digest-derived namespaces keep different artifact sets
 apart. In stable mode, serialize all writers; a receipt's previous version ID describes the
 preflight observation and may not be the immediately preceding version if another writer raced.
 
@@ -316,7 +336,7 @@ print it.
 
 Create the matching Git tag and GitHub Release only after npm accepts the exact version commit.
 Promotion to `latest` must move the dist-tag to the already verified artifact and must not rebuild
-it. Real client projects and disposable versioned Spaces buckets become pilots after the first
+it. Real client projects and disposable versioned and unversioned Spaces buckets become pilots after the first
 `next` release. Fixes ship as new immutable `next` versions; promotion waits until pilots cover
 repeat uploads, collisions, retained versions, receipt redaction, public retrieval, project-specific
 delivery configuration, and the complete public-readiness review.

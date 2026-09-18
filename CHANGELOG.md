@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1
+
+### Patch Changes
+
+- Allow stable and immutable deployments to buckets with disabled or suspended versioning. Versioned
+  objects retain exact-version verification; unversioned objects are verified using their ETag and
+  the planned metadata, including the final check before CDN invalidation. No bucket-versioning
+  lookup or permission is required by default. Opt in to the previous strict requirement with
+  `--require-bucket-versioning` or API `requireBucketVersioning: true`. Existing plans remain valid.
+
 ## 0.2.0
 
 ### Minor Changes

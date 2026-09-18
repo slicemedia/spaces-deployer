@@ -53,7 +53,7 @@ interface FileMetadata {
 
 type RemoteFileDecision =
   | { readonly action: "upload"; readonly previousVersionId?: string }
-  | { readonly action: "skip"; readonly etag?: string; readonly versionId: string };
+  | { readonly action: "skip"; readonly etag?: string; readonly versionId?: string };
 
 type UnsignedPlan =
   Omit<SpacesImmutableDeploymentPlan, "planId"> | Omit<SpacesStableDeploymentPlan, "planId">;
@@ -142,6 +142,13 @@ export async function applyDeploymentPlan(
   if (options.confirmedPlanId !== validatedPlan.planId) {
     throw new Error("confirmedPlanId must exactly match the deployment plan ID.");
   }
+  if (
+    options.requireBucketVersioning !== undefined &&
+    typeof options.requireBucketVersioning !== "boolean"
+  ) {
+    throw new Error("requireBucketVersioning must be a boolean.");
+  }
+  const requireBucketVersioning = options.requireBucketVersioning === true;
   const credentials = validateCredentials(options.credentials);
   const cdnToken =
     validatedPlan.schemaVersion === 3 ? validateCdnToken(options.cdnApiToken) : undefined;
@@ -165,8 +172,16 @@ export async function applyDeploymentPlan(
       failDeployment(validatedPlan, timestamp, redactError(error, credentials, [cdnToken]), []);
     }
   }
-  await assertBucketVersioning(client, validatedPlan, timestamp, credentials);
-  const decisions = await preflightRemoteFiles(client, validatedPlan, timestamp, credentials);
+  if (requireBucketVersioning) {
+    await assertBucketVersioning(client, validatedPlan, timestamp, credentials);
+  }
+  const decisions = await preflightRemoteFiles(
+    client,
+    validatedPlan,
+    timestamp,
+    credentials,
+    requireBucketVersioning,
+  );
   const receipts: SpacesDeploymentFileReceipt[] = [];
 
   for (const [index, file] of validatedPlan.files.entries()) {
@@ -184,7 +199,7 @@ export async function applyDeploymentPlan(
         key: file.key,
         status: "skipped",
         ...(decision.etag === undefined ? {} : { etag: decision.etag }),
-        versionId: decision.versionId,
+        ...(decision.versionId === undefined ? {} : { versionId: decision.versionId }),
       });
       continue;
     }
@@ -231,22 +246,27 @@ export async function applyDeploymentPlan(
             : { previousVersionId: decision.previousVersionId }),
         },
       ];
-      failDeployment(validatedPlan, timestamp, `Versioned upload failed: ${errorMessage}`, failed);
+      failDeployment(validatedPlan, timestamp, `Upload failed: ${errorMessage}`, failed);
     }
 
-    const versionId = response.VersionId;
-    if (versionId === undefined || versionId.trim() === "") {
+    const versionId = durableVersionId(response.VersionId);
+    const etag = nonemptyValue(response.ETag);
+    if (versionId === undefined && (requireBucketVersioning || etag === undefined)) {
       failDeployment(
         validatedPlan,
         timestamp,
-        "DigitalOcean Spaces did not return a version ID for the uploaded object.",
+        requireBucketVersioning
+          ? "DigitalOcean Spaces did not return a version ID for the uploaded object."
+          : "DigitalOcean Spaces did not return a version ID or ETag for the uploaded object.",
         [
           ...receipts,
           {
             key: file.key,
             status: "failed",
-            ...(response.ETag === undefined ? {} : { etag: response.ETag }),
-            error: "missing-upload-version-id",
+            ...(etag === undefined ? {} : { etag }),
+            error: requireBucketVersioning
+              ? "missing-upload-version-id"
+              : "missing-upload-identity",
             ...(decision.previousVersionId === undefined
               ? {}
               : { previousVersionId: decision.previousVersionId }),
@@ -259,7 +279,7 @@ export async function applyDeploymentPlan(
       validatedPlan,
       file,
       versionId,
-      response.ETag,
+      etag,
       timestamp,
       credentials,
       receipts,
@@ -268,8 +288,8 @@ export async function applyDeploymentPlan(
     receipts.push({
       key: file.key,
       status: "uploaded",
-      ...(response.ETag === undefined ? {} : { etag: response.ETag }),
-      versionId,
+      ...(etag === undefined ? {} : { etag }),
+      ...(versionId === undefined ? {} : { versionId }),
       ...(decision.previousVersionId === undefined
         ? {}
         : { previousVersionId: decision.previousVersionId }),
@@ -301,7 +321,7 @@ async function verifyUploadedFile(
   client: S3Client,
   plan: SpacesDeploymentPlan,
   file: SpacesDeploymentFile,
-  versionId: string,
+  versionId: string | undefined,
   etag: string | undefined,
   timestamp: string,
   credentials: SpacesCredentials,
@@ -314,36 +334,39 @@ async function verifyUploadedFile(
       new HeadObjectCommand({
         Bucket: plan.target.bucket,
         Key: file.key,
-        VersionId: versionId,
+        ...(versionId === undefined ? {} : { VersionId: versionId }),
       }),
     );
   } catch (error) {
     const errorMessage = redactError(error, credentials, deploymentSensitiveValues(plan, file));
-    failDeployment(plan, timestamp, `Cannot verify uploaded object version: ${errorMessage}`, [
+    failDeployment(plan, timestamp, `Cannot verify uploaded object: ${errorMessage}`, [
       ...completedReceipts,
       {
         key: file.key,
         status: "failed",
         ...(etag === undefined ? {} : { etag }),
-        versionId,
+        ...(versionId === undefined ? {} : { versionId }),
         ...(previousVersionId === undefined ? {} : { previousVersionId }),
         error: `post-upload-verification-error: ${errorMessage}`,
       },
     ]);
   }
 
-  if (!remoteFileMatches(response, plan, file) || response.VersionId !== versionId) {
+  if (
+    !remoteFileMatches(response, plan, file) ||
+    !objectIdentityMatches(response, versionId, etag)
+  ) {
     failDeployment(
       plan,
       timestamp,
-      "Uploaded object version did not read back with the planned metadata.",
+      "Uploaded object did not read back with the planned metadata and identity.",
       [
         ...completedReceipts,
         {
           key: file.key,
           status: "failed",
           ...(etag === undefined ? {} : { etag }),
-          versionId,
+          ...(versionId === undefined ? {} : { versionId }),
           ...(previousVersionId === undefined ? {} : { previousVersionId }),
           error: "post-upload-verification-mismatch",
         },
@@ -368,7 +391,7 @@ async function assertBucketVersioning(
     failDeployment(
       plan,
       timestamp,
-      `Cannot verify mandatory bucket versioning: ${redactError(
+      `Cannot verify required bucket versioning: ${redactError(
         error,
         credentials,
         deploymentSensitiveValues(plan),
@@ -391,6 +414,7 @@ async function preflightRemoteFiles(
   plan: SpacesDeploymentPlan,
   timestamp: string,
   credentials: SpacesCredentials,
+  requireBucketVersioning: boolean,
 ): Promise<readonly RemoteFileDecision[]> {
   const decisions: RemoteFileDecision[] = [];
   for (const file of plan.files) {
@@ -406,8 +430,8 @@ async function preflightRemoteFiles(
           [{ key: file.key, status: "failed", error: "occupied-content-mismatch" }],
         );
       }
-      const versionId = response.VersionId;
-      if (versionId === undefined || versionId.trim() === "") {
+      const versionId = durableVersionId(response.VersionId);
+      if (requireBucketVersioning && versionId === undefined) {
         failDeployment(
           plan,
           timestamp,
@@ -416,13 +440,25 @@ async function preflightRemoteFiles(
         );
       }
       if (!remoteFileMatches(response, plan, file)) {
-        decisions.push({ action: "upload", previousVersionId: versionId });
+        decisions.push({
+          action: "upload",
+          ...(versionId === undefined ? {} : { previousVersionId: versionId }),
+        });
         continue;
+      }
+      const etag = nonemptyValue(response.ETag);
+      if (versionId === undefined && etag === undefined) {
+        failDeployment(
+          plan,
+          timestamp,
+          "A matching object did not include a version ID or ETag for verification.",
+          [{ key: file.key, status: "failed", error: "existing-object-missing-identity" }],
+        );
       }
       decisions.push({
         action: "skip",
-        ...(response.ETag === undefined ? {} : { etag: response.ETag }),
-        versionId,
+        ...(etag === undefined ? {} : { etag }),
+        ...(versionId === undefined ? {} : { versionId }),
       });
     } catch (error) {
       if (error instanceof SpacesDeploymentError) throw error;
@@ -468,6 +504,25 @@ function cacheControl(plan: SpacesDeploymentPlan): string {
   return plan.schemaVersion === 3 ? plan.cacheControl : IMMUTABLE_CACHE_CONTROL;
 }
 
+function nonemptyValue(value: string | undefined): string | undefined {
+  return value === undefined || value.trim() === "" ? undefined : value;
+}
+
+function durableVersionId(value: string | undefined): string | undefined {
+  // The S3 "null" version is mutable in unversioned or suspended buckets.
+  return value === "null" ? undefined : nonemptyValue(value);
+}
+
+function objectIdentityMatches(
+  response: { readonly VersionId?: string | undefined; readonly ETag?: string | undefined },
+  versionId: string | undefined,
+  etag: string | undefined,
+): boolean {
+  return versionId === undefined
+    ? etag !== undefined && response.ETag === etag
+    : response.VersionId === versionId;
+}
+
 async function verifyCurrentFiles(
   client: S3Client,
   plan: SpacesStableDeploymentPlan,
@@ -481,8 +536,10 @@ async function verifyCurrentFiles(
       const response = await client.send(
         new HeadObjectCommand({ Bucket: plan.target.bucket, Key: file.key }),
       );
+      const receipt = receipts[index];
       if (
-        response.VersionId !== receipts[index]?.versionId ||
+        receipt === undefined ||
+        !objectIdentityMatches(response, receipt.versionId, receipt.etag) ||
         !remoteFileMatches(response, plan, file)
       ) {
         errorMessage = "current-version-mismatch";

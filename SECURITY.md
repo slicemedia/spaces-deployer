@@ -7,7 +7,7 @@ receive best-effort security fixes. Older `0.x` lines do not receive guaranteed 
 project provides no response-time, remediation, or long-term-support SLA.
 
 Slice Media Spaces Deployer treats planning, human review, exact confirmation, application,
-version-specific read-back, and receipt inspection as separate phases. Credentials must remain
+object read-back, and receipt inspection as separate phases. Credentials must remain
 outside source control and are accepted by the CLI only through environment variables during
 apply. Plans remain local under `.slicemedia/spaces-deployer/`; they contain local paths and target
 metadata even though they contain no credentials. The CLI verifies Git ignore status and refuses
@@ -24,17 +24,27 @@ semantics there. Use a supported POSIX environment, or keep plans in memory and 
 storage and same-user process boundary independently.
 
 Before a release, run `pnpm check` and inspect the `npm pack --dry-run` manifest. Never weaken
-mandatory bucket versioning, complete remote HEAD preflight, exact-version post-upload read-back,
-nonempty provider version IDs, mode-specific key validation, resource limits, private plan storage,
+complete remote HEAD preflight, post-upload identity and metadata verification,
+mode-specific key validation, resource limits, private plan storage,
 exact plan validation, local drift checks, or credential redaction without a reviewed breaking
 change and adversarial tests.
 
-The HEAD-to-PUT interval is not atomic. Bucket versioning limits damage from a racing writer by retaining prior versions; it does not provide mutual exclusion or an atomic create-only write.
+Bucket versioning is optional by default. `requireBucketVersioning: true` (CLI
+`--require-bucket-versioning`) explicitly requires enabled bucket versioning and durable object
+version IDs. Without that option, no `GetBucketVersioning` permission is needed. Uploads and skipped
+objects must provide a durable version ID or a nonempty ETag. Read-back verifies exact version IDs
+when available; otherwise it checks the current object's ETag and all planned metadata. The S3
+`null` version is mutable and is treated as unversioned. Tests must cover unversioned replacements,
+missing identifiers, ETag and metadata mismatches, purge retries, and the strict opt-in checks.
+
+The HEAD-to-PUT interval is not atomic. Enabled bucket versioning limits damage from a racing writer
+by retaining prior versions; it does not provide mutual exclusion or an atomic create-only write.
+Without versioning, replaced bytes are not preserved and recovery requires redeploying an older build.
 
 Stable schema-v3 plans authorize replacement only of their listed keys under a dedicated prefix.
 They bind the cache policy, CDN endpoint ID and derived prefix purge to the plan ID. Before writing,
 the CDN origin must match the Spaces target. Purging occurs only after successful upload read-back
-and a check that the planned versions are current. The only DELETE operation targets the CDN
+and a check that the planned object identities and metadata are current. The only DELETE operation targets the CDN
 endpoint's `/cache` resource, never stored objects or the endpoint itself. CDN API tokens are
 supplied separately during apply, never serialized, and never forwarded through redirects.
 Provider response bodies and raw CDN transport errors are not included in diagnostics. A failed
@@ -46,5 +56,5 @@ for scope expansion, plan tampering, mismatched origins, partial writes and purg
 
 The package does not manage public access, bucket policy, ACL, CORS, CDN configuration, domains, or
 Webflow publishing. Treat those as separate reviewed operations. Read-back validates provider metadata for
-the exact uploaded version; it is not a remote-body hash or a defense against a malicious storage
+the uploaded version or ETag; it is not a remote-body hash or a defense against a malicious storage
 administrator.

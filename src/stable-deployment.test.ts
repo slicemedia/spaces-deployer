@@ -64,7 +64,6 @@ describe("stable URL deployments", () => {
     });
     expect(remote.events).toEqual([
       "cdn:GET",
-      "versioning",
       "head:current",
       "head:current",
       "put",
@@ -215,18 +214,186 @@ describe("stable URL deployments", () => {
   });
 
   it.each(["Suspended", undefined])(
-    "requires bucket versioning (%s) before stable replacements",
+    "enforces opt-in bucket versioning (%s) before stable replacements",
     async (status) => {
       const { plan } = await fixture();
       const remote = provider();
       remote.send.mockResolvedValueOnce({ Status: status });
-      const error = await failure(apply(plan, remote));
+      const error = await failure(apply(plan, remote, true));
       expect(error.message).toContain("versioning must be Enabled");
       expect(remote.events).toEqual(["cdn:GET"]);
     },
   );
 
-  it("does not start uploads if any existing object lacks a recoverable version ID", async () => {
+  it.each(["disabled", "suspended"] as const)(
+    "uploads, replaces, skips and purges with versioning %s without a versioning lookup",
+    async (versioning) => {
+      const { plan, options } = await fixture();
+      const remote = provider(versioning);
+      const first = await apply(plan, remote);
+      expect(first).toMatchObject({ status: "applied", cdn: { status: "requested" } });
+      for (const file of first.files) {
+        expect(file.etag).toBeTruthy();
+        expect(file).not.toHaveProperty("versionId");
+        expect(file).not.toHaveProperty("previousVersionId");
+      }
+      await writeFile(path.join(options.directory, "project.js"), "console.info('replacement');\n");
+      const next = await createDeploymentPlan({ ...options, releaseVersion: "release-2" });
+      const replaced = await apply(next, remote);
+      expect(replaced.files.every((file) => file.status === "uploaded")).toBe(true);
+      expect(replaced.files.map((file) => file.key)).toEqual(first.files.map((file) => file.key));
+      expect(replaced.files.every((file) => file.previousVersionId === undefined)).toBe(true);
+      for (const history of remote.versions.values()) expect(history).toHaveLength(1);
+      remote.events.length = 0;
+      const repeated = await apply(next, remote);
+      expect(repeated.files.every((file) => file.status === "skipped")).toBe(true);
+      expect(remote.events.at(-1)).toBe("cdn:DELETE");
+      expect(remote.events).not.toContain("put");
+      expect(
+        remote.send.mock.calls.some(([command]) => command instanceof GetBucketVersioningCommand),
+      ).toBe(false);
+      expect(
+        remote.send.mock.calls.every(
+          ([command]) =>
+            !(command instanceof HeadObjectCommand) || command.input.VersionId === undefined,
+        ),
+      ).toBe(true);
+    },
+  );
+
+  it("adopts an existing null-version object while preserving versioned upload verification", async () => {
+    const { plan } = await fixture();
+    const remote = provider();
+    remote.versions.set(plan.files[0]!.key, [
+      {
+        id: "null",
+        etag: '"legacy"',
+        input: { Bucket: plan.target.bucket, Key: plan.files[0]!.key, Body: "old contents" },
+      },
+    ]);
+    const receipt = await apply(plan, remote);
+    expect(receipt.files[0]).toMatchObject({ status: "uploaded", versionId: "version-1" });
+    expect(receipt.files[0]).not.toHaveProperty("previousVersionId");
+    expect(remote.events).toContain("head:version");
+    expect(remote.events.at(-1)).toBe("cdn:DELETE");
+  });
+
+  it("retries an unversioned purge failure without uploading again", async () => {
+    const { plan } = await fixture();
+    const remote = provider("disabled");
+    remote.purgeStatus = 503;
+    const error = await failure(apply(plan, remote));
+    expect(error.receipt).toMatchObject({ status: "failed", cdn: { status: "failed" } });
+    expect(error.receipt.files.every((file) => file.status === "uploaded")).toBe(true);
+    remote.purgeStatus = 204;
+    remote.events.length = 0;
+    const receipt = await apply(plan, remote);
+    expect(receipt).toMatchObject({ status: "applied", cdn: { status: "requested" } });
+    expect(receipt.files.every((file) => file.status === "skipped")).toBe(true);
+    expect(remote.events).not.toContain("put");
+    expect(remote.events.at(-1)).toBe("cdn:DELETE");
+  });
+
+  it.each([
+    ["read-back", { ETag: '"other-upload"' }],
+    ["read-back", { ETag: undefined }],
+    ["read-back", { ContentLength: 999 }],
+    ["read-back", { ContentType: "text/plain" }],
+    ["read-back", { CacheControl: "public, max-age=31536000, immutable" }],
+    ["read-back", { Metadata: { sha384: "sha384-changed", "artifact-set-digest": "changed" } }],
+    ["current", { ETag: '"racing-upload"' }],
+    ["current", { ETag: undefined }],
+    ["current", { Metadata: {} }],
+  ] as const)("withholds an unversioned purge on %s mismatch %j", async (stage, changed) => {
+    const { plan } = await fixture();
+    const remote = provider("disabled");
+    const send = remote.send.getMockImplementation()!;
+    let reads = 0;
+    remote.send.mockImplementation(async (command) => {
+      const result = await send(command);
+      if (command instanceof HeadObjectCommand && command.input.Key === plan.files[0]!.key) {
+        reads += 1;
+        if (reads === (stage === "read-back" ? 1 : 2)) return { ...result, ...changed };
+      }
+      return result;
+    });
+    const error = await failure(apply(plan, remote));
+    expect(error.receipt).toMatchObject({ status: "failed", cdn: { status: "not-requested" } });
+    expect(error.receipt.files[0]?.error).toBe(
+      stage === "read-back" ? "post-upload-verification-mismatch" : "current-version-mismatch",
+    );
+    expect(remote.events).not.toContain("cdn:DELETE");
+  });
+
+  it.each([undefined, "", "   "])(
+    "rejects a versionless upload with unusable ETag %s",
+    async (etag) => {
+      const { plan } = await fixture();
+      const remote = provider("suspended");
+      const send = remote.send.getMockImplementation()!;
+      remote.send.mockImplementation(async (command) => {
+        const result = await send(command);
+        return command instanceof PutObjectCommand ? { ...result, ETag: etag } : result;
+      });
+      const error = await failure(apply(plan, remote));
+      expect(error.receipt.files[0]?.error).toBe("missing-upload-identity");
+      expect(remote.events).not.toContain("cdn:DELETE");
+    },
+  );
+
+  it("refuses to skip an unversioned object without an ETag", async () => {
+    const { plan } = await fixture();
+    const remote = provider("disabled");
+    await apply(plan, remote);
+    remote.events.length = 0;
+    const send = remote.send.getMockImplementation()!;
+    remote.send.mockImplementation(async (command) => {
+      const result = await send(command);
+      return command instanceof HeadObjectCommand ? { ...result, ETag: undefined } : result;
+    });
+    const error = await failure(apply(plan, remote));
+    expect(error.receipt.files[0]?.error).toBe("existing-object-missing-identity");
+    expect(remote.events).not.toContain("put");
+    expect(remote.events).not.toContain("cdn:DELETE");
+  });
+
+  it("supports unversioned immutable plans and still rejects occupied mismatches", async () => {
+    const { options } = await fixture();
+    const plan = await createDeploymentPlan({
+      directory: options.directory,
+      endpoint: options.endpoint,
+      region: options.region,
+      bucket: options.bucket,
+      prefix: options.prefix,
+      releaseVersion: options.releaseVersion,
+      mode: "immutable",
+    });
+    const remote = provider("disabled");
+    const first = await apply(plan, remote);
+    expect(first.files.every((file) => file.status === "uploaded")).toBe(true);
+    const second = await apply(plan, remote);
+    expect(second.files.every((file) => file.status === "skipped")).toBe(true);
+    expect(remote.cdnFetch).not.toHaveBeenCalled();
+    const existing = remote.versions.get(plan.files[0]!.key)![0]!;
+    remote.versions.set(plan.files[0]!.key, [
+      { ...existing, input: { ...existing.input, Metadata: {} } },
+    ]);
+    remote.events.length = 0;
+    await expect(apply(plan, remote)).rejects.toThrow("occupied by content");
+    expect(remote.events).not.toContain("put");
+  });
+
+  it("rejects a non-boolean versioning policy before remote requests", async () => {
+    const { plan } = await fixture();
+    const remote = provider();
+    await expect(apply(plan, remote, "false" as unknown as boolean)).rejects.toThrow(
+      "must be a boolean",
+    );
+    expect(remote.send).not.toHaveBeenCalled();
+    expect(remote.cdnFetch).not.toHaveBeenCalled();
+  });
+
+  it("enforces opt-in recoverable version IDs before uploads", async () => {
     const { plan } = await fixture();
     const remote = provider();
     const send = remote.send.getMockImplementation()!;
@@ -235,7 +402,7 @@ describe("stable URL deployments", () => {
         return { ContentLength: 100 };
       return send(command);
     });
-    const error = await failure(apply(plan, remote));
+    const error = await failure(apply(plan, remote, true));
     expect(error.receipt).toMatchObject({ cdn: { status: "not-requested" } });
     expect(remote.events).not.toContain("put");
     expect(remote.events).not.toContain("cdn:DELETE");
@@ -331,21 +498,35 @@ async function fixture() {
   return { plan, options };
 }
 
-function provider() {
+function provider(versioning: "enabled" | "disabled" | "suspended" = "enabled") {
   const events: string[] = [];
-  const versions = new Map<string, Array<{ id: string; input: PutObjectCommandInput }>>();
+  const versions = new Map<
+    string,
+    Array<{ id: string; etag: string; input: PutObjectCommandInput }>
+  >();
   let counter = 0;
   const send = vi.fn(async (command: unknown): Promise<Record<string, unknown>> => {
     if (command instanceof GetBucketVersioningCommand) {
       events.push("versioning");
-      return { Status: "Enabled" };
+      return {
+        Status:
+          versioning === "enabled"
+            ? "Enabled"
+            : versioning === "suspended"
+              ? "Suspended"
+              : undefined,
+      };
     }
     if (command instanceof PutObjectCommand) {
       events.push("put");
-      const id = `version-${++counter}`;
+      const etag = `"version-${++counter}"`;
+      const id = versioning === "enabled" ? `version-${counter}` : "null";
       const key = command.input.Key!;
-      versions.set(key, [...(versions.get(key) ?? []), { id, input: command.input }]);
-      return { VersionId: id, ETag: `"${id}"` };
+      versions.set(key, [
+        ...(versioning === "enabled" ? (versions.get(key) ?? []) : []),
+        { id, etag, input: command.input },
+      ]);
+      return { VersionId: versioning === "disabled" ? undefined : id, ETag: etag };
     }
     if (command instanceof HeadObjectCommand) {
       events.push(command.input.VersionId === undefined ? "head:current" : "head:version");
@@ -357,8 +538,8 @@ function provider() {
       if (version === undefined)
         throw Object.assign(new Error("Not Found"), { $metadata: { httpStatusCode: 404 } });
       return {
-        VersionId: version.id,
-        ETag: `"${version.id}"`,
+        VersionId: versioning === "disabled" ? undefined : version.id,
+        ETag: version.etag,
         CacheControl: version.input.CacheControl,
         ContentLength: version.input.ContentLength,
         ContentType: version.input.ContentType,
@@ -386,10 +567,15 @@ function provider() {
   return remote;
 }
 
-function apply(plan: SpacesDeploymentPlan, remote: ReturnType<typeof provider>) {
+function apply(
+  plan: SpacesDeploymentPlan,
+  remote: ReturnType<typeof provider>,
+  requireBucketVersioning = false,
+) {
   return applyDeploymentPlan(plan, {
     confirmedPlanId: plan.planId,
     credentials,
+    requireBucketVersioning,
     cdnApiToken: token,
     client: { send: remote.send } as unknown as S3Client,
     cdnFetch: remote.cdnFetch,
